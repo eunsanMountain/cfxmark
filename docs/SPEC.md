@@ -102,8 +102,7 @@ the opaque mechanisms documented in [`OPAQUE.md`](OPAQUE.md):
 * **Block opaque** — sentinel-wrapped fenced code block. Used for
   `<ac:structured-macro>` invocations whose `ac:name` is not in the
   registry, `<table>` with non-cell-span structural problems,
-  `<pre><code>` with embedded non-text elements, anything inside an
-  `<ac:layout>` Confluence editor wrapper.
+  `<pre><code>` with embedded non-text elements.
 * **Inline opaque** — short `[label](cfx:op-XXXXXXXX)` link with the
   XML payload stored in a `cfxmark:payloads` sidecar at the bottom
   of the document. Used for unknown elements that appear in inline

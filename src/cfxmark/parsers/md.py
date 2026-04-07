@@ -347,7 +347,7 @@ class _MdConverter:
             if m:
                 kind = m.group(1)
                 idx = int(m.group(2))
-                if kind == _OPAQUE_MARKER:
+                if kind == _OPAQUE_MARKER and 0 <= idx < len(self.pre.opaques):
                     op_cap = self.pre.opaques[idx]
                     return [
                         OpaqueBlock(
@@ -355,7 +355,9 @@ class _MdConverter:
                             opaque_id=op_cap.opaque_id,
                         )
                     ]
-                if kind == _DIRECTIVE_MARKER:
+                if kind == _DIRECTIVE_MARKER and 0 <= idx < len(
+                    self.pre.directives
+                ):
                     dir_cap = self.pre.directives[idx]
                     body_blocks = self._parse_inner_body(dir_cap.body_source)
                     return [

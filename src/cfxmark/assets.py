@@ -134,12 +134,36 @@ def resolve_assets(
         cursor = marker.end()
 
     out_parts.append(md[cursor:])
-    return "".join(out_parts)
+    result = "".join(out_parts)
+
+    # Fallback: opaque blocks (and the inline payload sidecar) preserve
+    # raw ``<ri:attachment ri:filename="...">`` references that have no
+    # paired Markdown image link. In ``sidecar`` mode we still need to
+    # download those bytes so the caller's asset directory is complete.
+    # ``inline`` mode has no place to embed them (the XML is opaque
+    # text), so we leave it alone there.
+    if mode == "sidecar":
+        assert asset_dir_path is not None
+        seen = {m.group("src") for m in _ASSET_MARKER_RE.finditer(result)}
+        for filename in _OPAQUE_RI_FILENAME_RE.findall(_CDATA_RE.sub("", result)):
+            if filename in seen:
+                continue
+            seen.add(filename)
+            bytes_data = fetcher(filename)
+            if bytes_data is None:
+                continue
+            (asset_dir_path / filename).write_bytes(bytes_data)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+_OPAQUE_RI_FILENAME_RE = re.compile(r'<ri:attachment[^>]*ri:filename="([^"]+)"')
+_CDATA_RE = re.compile(r"<!\[CDATA\[.*?\]\]>", re.DOTALL)
 
 
 _IMAGE_LINK_RE = re.compile(

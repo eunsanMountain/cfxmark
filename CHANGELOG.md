@@ -5,6 +5,69 @@ All notable changes to **cfxmark** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] — 2026-04-07
+
+### Changed
+
+- `render_cfx` now returns a third element — a ``warnings`` list —
+  alongside ``(xhtml, attachments)``. Any ``::: jira`` / ``::: toc``
+  (or other parameter-only directive) whose body is silently dropped
+  by its handler now surfaces a human-readable warning via
+  ``ConversionResult.warnings`` so callers can correct their
+  Markdown instead of discovering the drop on Confluence.
+
+## [0.1.2] — 2026-04-07
+
+### Fixed
+
+- Attachment enumeration now strips CDATA sections before scanning
+  for `<ri:attachment>`, so a Confluence ``code`` macro documenting
+  storage XML no longer leaks phantom filenames into
+  `result.attachments`. `resolve_assets(mode="sidecar")` applies the
+  same CDATA strip on its opaque-block fallback.
+- `to_cfx` now emits only the **basename** of a local-image path in
+  `<ri:attachment ri:filename="...">` (Confluence stores attachments
+  in a flat per-page namespace). `result.attachments` still reports
+  the caller's original path — including any directory prefix — so
+  the caller knows where to read the bytes from on disk.
+
+## [0.1.1] — 2026-04-07
+
+### Fixed
+
+- `ConversionResult.attachments` now enumerates **every**
+  `ri:attachment` reference in the output XHTML, including those
+  trapped inside Grade III opaque blocks (e.g. `<ac:image>` inside
+  `<pre><code>`). Previously only Grade I/II native `<ac:image>`
+  references were reported, so callers silently missed attachments
+  they needed to upload. `to_md` also populates `attachments` now
+  (previously always empty).
+- `resolve_assets(mode="sidecar")` downloads opaque-block attachments
+  into `asset_dir` as a fallback, keeping the sidecar directory a
+  complete asset set regardless of how the image was preserved.
+- `to_cfx` no longer crashes with `IndexError` when user-typed
+  Markdown contains a literal `` `CFXMARK_OPAQUE-N-CFXMARK` `` /
+  `` `CFXMARK_DIRECTIVE-N-CFXMARK` `` token whose index has no
+  matching capture — the region falls back to plain inline code.
+
+### Docs
+
+- README custom-macro example uses a valid `AdmonitionHandler` flavour
+  (`info`/`note`/`warning`/`tip`); the previous `"danger"` example
+  raised `ValueError`.
+- README docs/SPEC/OPAQUE/LICENSE links rewritten as absolute GitHub
+  URLs so they resolve correctly when rendered on PyPI.
+- `docs/SPEC.md` no longer claims `<ac:layout>` wrappers become opaque
+  blocks; cfxmark flattens them transparently.
+
+### Packaging
+
+- `pyproject.toml` switched to PEP 639 license metadata
+  (`license = "MIT"` + `license-files = ["LICENSE"]`); the redundant
+  `License :: OSI Approved :: MIT License` classifier was removed.
+- Added `Documentation` and `Changelog` entries to `[project.urls]`
+  for the PyPI sidebar.
+
 ## [0.1.0] — 2026-04-07
 
 ### Added

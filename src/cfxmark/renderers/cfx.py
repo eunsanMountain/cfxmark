@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 
 import lxml.etree as ET
 
@@ -57,6 +58,7 @@ from cfxmark.xml_ns import (
 class RenderContext:
     registry: MacroRegistry
     attachments: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -148,10 +150,15 @@ def _render_image(node: Image, ctx: RenderContext) -> ET._Element:
             {ri_attr("value"): node.src},
         )
     else:
+        # Confluence stores attachments in a flat per-page namespace,
+        # so the ``ri:filename`` must be the basename only. We keep the
+        # *original* path in ``ctx.attachments`` so the caller knows
+        # where to read the bytes from on the local filesystem.
+        basename = PurePosixPath(node.src).name or node.src
         ri_el = ET.SubElement(
             img,
             ri_tag("attachment"),
-            {ri_attr("filename"): node.src},
+            {ri_attr("filename"): basename},
         )
         if node.src not in ctx.attachments:
             ctx.attachments.append(node.src)
@@ -332,7 +339,24 @@ def _render_directive(
                 rendered.append(sub)
         return rendered
 
-    return handler.to_cfx(block, body_renderer)
+    rendered = handler.to_cfx(block, body_renderer)
+    # If the caller supplied body content but the handler emitted no
+    # ``rich-text-body`` child, the handler silently dropped it. This
+    # typically happens when a user writes ``::: jira`` / ``::: toc``
+    # with a body — these macros only carry parameters. Surface a
+    # warning so the caller knows something was lost instead of
+    # failing silently.
+    if block.body:
+        has_body = any(
+            child.tag.rsplit("}", 1)[-1] == "rich-text-body" for child in rendered
+        )
+        if not has_body:
+            ctx.warnings.append(
+                f"directive '::: {block.name}' ignores body content; "
+                "move values to header parameters (e.g. "
+                f'``::: {block.name} key="..."``).'
+            )
+    return rendered
 
 
 def _render_inline_opaque(node: InlineOpaque) -> ET._Element:
@@ -432,16 +456,17 @@ def render_cfx(
     document: Document,
     *,
     registry: MacroRegistry | None = None,
-) -> tuple[str, list[str]]:
+) -> tuple[str, list[str], list[str]]:
     """Render a cfxmark AST to a Confluence storage format fragment.
 
     :param document: The document to render.
     :param registry: Macro registry to use. Defaults to
         :data:`cfxmark.macros.default_registry`.
-    :returns: ``(xhtml, attachments)`` where ``attachments`` is a
+    :returns: ``(xhtml, attachments, warnings)``. ``attachments`` is a
         deduplicated list of local file references that the caller
         should upload via the Confluence REST API before pushing the
-        rendered XHTML.
+        rendered XHTML. ``warnings`` carries human-readable messages
+        about anything the renderer could not represent exactly.
     """
 
     ctx = RenderContext(registry=registry or default_registry)
@@ -468,7 +493,7 @@ def render_cfx(
         fragments.append(raw)
 
     xhtml = "".join(fragments)
-    return xhtml, ctx.attachments
+    return xhtml, ctx.attachments, ctx.warnings
 
 
 _NS_ATTR_RE = re.compile(r'\s+xmlns(?::\w+)?="[^"]*"')

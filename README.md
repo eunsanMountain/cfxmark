@@ -66,8 +66,10 @@ cfxmark grades every Confluence construct into one of three buckets:
 | **II — Directive** | Confluence macros with a known Markdown directive mapping (`info`, `note`, `warning`, `tip`, `jira`, `expand`, `toc`) | Lossless after canonicalization. Pluggable via `MacroRegistry`. |
 | **III — Opaque** | Everything else | Captured byte-for-byte through cfxmark's opaque-block / inline-opaque mechanism. **Never dropped, never rewritten.** |
 
-See [`docs/SPEC.md`](docs/SPEC.md) for the full mapping table and
-[`docs/OPAQUE.md`](docs/OPAQUE.md) for the opaque-block format.
+See [`docs/SPEC.md`](https://github.com/eunsanMountain/cfxmark/blob/main/docs/SPEC.md)
+for the full mapping table and
+[`docs/OPAQUE.md`](https://github.com/eunsanMountain/cfxmark/blob/main/docs/OPAQUE.md)
+for the opaque-block format.
 
 ## Usage
 
@@ -239,7 +241,10 @@ from cfxmark.macros.builtins import AdmonitionHandler
 
 # Start from the default registry and add your own.
 my_registry = cfxmark.default_registry.copy()
-my_registry.register(AdmonitionHandler("danger"))  # treat ac:name="danger" as info-style
+# Built-in AdmonitionHandler accepts one of: "info", "note", "warning", "tip".
+# To promote a previously-opaque macro, write a small MacroHandler subclass —
+# see cfxmark/macros/builtins/admonition.py for a complete example.
+my_registry.register(AdmonitionHandler("warning"))
 
 result = cfxmark.to_md(xhtml, macros=my_registry)
 ```
@@ -307,4 +312,4 @@ own Confluence storage XHTML there and they will be exercised by
 
 ## License
 
-MIT. See [`LICENSE`](LICENSE).
+MIT. See [`LICENSE`](https://github.com/eunsanMountain/cfxmark/blob/main/LICENSE).

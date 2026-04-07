@@ -8,6 +8,7 @@ behaviour.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from cfxmark.ast import Document
@@ -19,6 +20,24 @@ from cfxmark.renderers.md import (
     MarkdownRenderOptions,
     render_md,
 )
+
+_RI_FILENAME_RE = re.compile(r'<ri:attachment[^>]*ri:filename="([^"]+)"')
+_CDATA_RE = re.compile(r"<!\[CDATA\[.*?\]\]>", re.DOTALL)
+
+
+def _enumerate_attachments(xhtml: str) -> tuple[str, ...]:
+    """Return every ``ri:filename`` referenced in ``xhtml`` in document
+    order, deduplicated. Catches both Grade I/II native ``<ac:image>``
+    references and Grade III opaque blocks that preserve raw XML.
+
+    CDATA sections (e.g. the body of a ``code`` macro demonstrating
+    Confluence XML) are stripped first, so documentation text that
+    happens to mention ``<ri:attachment>`` does not leak into the
+    result as a phantom attachment.
+    """
+
+    cleaned = _CDATA_RE.sub("", xhtml)
+    return tuple(dict.fromkeys(_RI_FILENAME_RE.findall(cleaned)))
 
 # ---------------------------------------------------------------------------
 # Options
@@ -103,12 +122,25 @@ def to_cfx(
 
     registry = macros or default_registry
     document, parse_warnings = parse_md(markdown, registry=registry)
-    xhtml, attachments = render_cfx(document, registry=registry)
+    xhtml, native_attachments, render_warnings = render_cfx(
+        document, registry=registry
+    )
+    # Native images preserve their *original* local path (which may
+    # contain directory prefixes like ``assets/img.png``) so the caller
+    # knows where to read bytes from. Opaque blocks contain byte-
+    # preserved XML that only exposes the Confluence basename; we
+    # merge those in without duplicating natives already listed.
+    native_basenames = {n.rsplit("/", 1)[-1] for n in native_attachments}
+    merged: list[str] = list(native_attachments)
+    for name in _enumerate_attachments(xhtml):
+        if name in native_basenames or name in merged:
+            continue
+        merged.append(name)
     return ConversionResult(
         xhtml=xhtml,
         markdown=None,
-        attachments=tuple(attachments),
-        warnings=tuple(parse_warnings),
+        attachments=tuple(merged),
+        warnings=tuple(parse_warnings) + tuple(render_warnings),
         document=document,
     )
 
@@ -143,7 +175,7 @@ def to_md(
     return ConversionResult(
         xhtml=None,
         markdown=markdown,
-        attachments=(),
+        attachments=_enumerate_attachments(xhtml),
         warnings=tuple(parse_warnings),
         document=document,
     )
