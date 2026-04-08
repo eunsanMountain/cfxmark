@@ -257,3 +257,93 @@ def test_round_trip_converges_after_one_pass_cjk(md_input: str) -> None:
     once = cfxmark.to_md(cfxmark.to_cfx(md_input).xhtml).markdown
     twice = cfxmark.to_md(cfxmark.to_cfx(once).xhtml).markdown
     assert once == twice
+
+
+# ---------------------------------------------------------------------------
+# Jira wiki property tests (v0.2.0)
+# ---------------------------------------------------------------------------
+
+import re as _re  # noqa: E402 — local import to avoid polluting module-level namespace
+
+
+@st.composite
+def document_simple_text(draw: st.DrawFn) -> str:
+    """Documents with only plain ASCII words — no special characters.
+
+    Used for text-preservation checks: every word that goes in must come
+    out (modulo wiki escaping, but plain alnum words need no escaping).
+    """
+    blocks = draw(st.lists(paragraph(), min_size=1, max_size=4))
+    return "\n\n".join(blocks) + "\n"
+
+
+@settings(
+    max_examples=100,
+    deadline=None,
+    suppress_health_check=[HealthCheck.too_slow],
+)
+@given(document_simple_text())
+def test_jira_wiki_text_preservation(md_input: str) -> None:
+    """Every plain-text word from the input appears in the Jira wiki output.
+
+    We generate documents containing only alphanumeric words (no special
+    characters) so that wiki escaping does not transform any token, and
+    verify that all words are present in the rendered output.
+    """
+    result = cfxmark.to_jira_wiki(md_input)
+    assert result.jira_wiki is not None
+    wiki = result.jira_wiki
+    for token in md_input.split():
+        # Strip markdown heading markers that are not content.
+        clean = token.lstrip("#").strip()
+        if clean:
+            assert clean in wiki, f"token {clean!r} missing from wiki output"
+
+
+@settings(
+    max_examples=100,
+    deadline=None,
+    suppress_health_check=[HealthCheck.too_slow],
+)
+@given(document_cjk())
+def test_jira_wiki_no_crash_cjk(md_input: str) -> None:
+    """to_jira_wiki must never raise on CJK-inclusive documents."""
+    result = cfxmark.to_jira_wiki(md_input)
+    # We only assert it didn't crash and produced something.
+    assert result.jira_wiki is not None
+
+
+@st.composite
+def document_headings_only(draw: st.DrawFn) -> str:
+    """A document consisting entirely of headings at varied levels."""
+    headings = draw(st.lists(heading(), min_size=1, max_size=8))
+    return "\n\n".join(headings) + "\n"
+
+
+_HEADING_LINE_RE = _re.compile(r"^h\d\. (.+)$", _re.MULTILINE)
+_MD_HEADING_RE = _re.compile(r"^(#{1,6}) (.+)$", _re.MULTILINE)
+
+
+@settings(
+    max_examples=100,
+    deadline=None,
+    suppress_health_check=[HealthCheck.too_slow],
+)
+@given(document_headings_only())
+def test_jira_wiki_heading_monotonicity(md_input: str) -> None:
+    """The order of heading texts is preserved after promotion.
+
+    The Jira wiki renderer may *promote* heading levels (H3→H2, H4→H3,
+    …) but must never reorder or drop headings.
+    """
+    result = cfxmark.to_jira_wiki(md_input)
+    assert result.jira_wiki is not None
+
+    # Extract heading text labels from the Markdown input (in order).
+    input_texts = [m.group(2).strip() for m in _MD_HEADING_RE.finditer(md_input)]
+    # Extract heading text labels from the Jira wiki output (in order).
+    output_texts = [m.group(1).strip() for m in _HEADING_LINE_RE.finditer(result.jira_wiki)]
+
+    assert input_texts == output_texts, (
+        f"Heading order changed:\n  input:  {input_texts}\n  output: {output_texts}"
+    )

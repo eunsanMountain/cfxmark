@@ -5,6 +5,73 @@ All notable changes to **cfxmark** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-05
+
+### Breaking
+- `resolve_assets` now validates attachment filenames by default
+  (`strict_filenames=True`). Unsafe names (parent traversal, absolute
+  paths, Windows path separators, null bytes, symlink escapes) raise
+  `AssetSecurityError`. Pass `strict_filenames=False` to preserve the
+  exact 0.1.x behavior.
+
+### Security
+- Path traversal defense baked into `resolve_assets` by default. The
+  validation fires BEFORE the caller's `fetcher` callback is invoked,
+  so a malicious filename never triggers a network request.
+- `ConfluenceClient.push_markdown` now validates every attachment
+  filename in `cfx_result.attachments` before any HTTP traffic is
+  issued. A malicious markdown like `![](../../../etc/passwd)` is
+  rejected with `AssetSecurityError` *before* `get_page` runs, so a
+  hostile markdown source cannot exfiltrate arbitrary host files
+  through the upload loop. Pass `strict_filenames=False` to opt out.
+- `ConfluenceClient.attachment_fetcher` now refuses off-host download
+  URLs. If a remote `_links.download` is absolute and its netloc does
+  not match `self._host`, the fetcher logs a warning and returns
+  `None` instead of forwarding the caller's bearer/basic credential
+  to an attacker-controlled host. Defense in depth against
+  compromised proxies / SSRF.
+- `ConfluenceClient.push_markdown` is now content-aware: a same-named
+  remote attachment is only treated as up-to-date when its
+  `extensions.fileSize` matches the local file. Size mismatch (or a
+  missing remote fileSize) forces a re-upload so Confluence creates a
+  new version. Closes a silent-staleness bug where edited local images
+  were skipped because their basename already existed on the page.
+  Future enhancement: hash-based dedup (plan §7).
+- `ConfluenceClient.attachment_fetcher` now catches raw `OSError`
+  (Python 3.11+ `TimeoutError` / `RemoteDisconnected` from `urlopen`),
+  matching the `_request` helper. A flaky post-handshake disconnect
+  no longer aborts the entire `pull_markdown` call.
+
+### Added
+- `cfxmark.AssetSecurityError` exception class.
+- `cfxmark.to_jira_wiki()` — new Jira wiki markup renderer alongside
+  Markdown and Confluence XHTML. Supports section slicing and
+  caller-controlled leading-notice drop patterns.
+- `ConversionResult.jira_wiki` field (appended — positional-arg compat preserved).
+- `cfxmark.confluence` module — optional urllib-based Confluence REST
+  client. Stdlib-only, zero runtime deps. Provides `ConfluenceClient`,
+  `PushResult`, `PullResult`, `HTTPError`, `ConfluenceVersionConflict`,
+  `BearerToken`, `BearerTokenFile`, `BasicAuth`, `EnvBearerToken`.
+- `cfxmark[confluence]` optional-dependency extra (namespace-only).
+
+### Changed
+- `Development Status` classifier bumped from Alpha to Beta.
+
+### Migration from 0.1.x
+
+- `resolve_assets` now validates filenames by default. If you relied on
+  no-validation (e.g. sidecar writes outside `asset_dir`), pass
+  `strict_filenames=False` and fix your caller.
+- `ConversionResult` gained a `jira_wiki` field. It is appended to the
+  dataclass, so positional-arg construction of `ConversionResult`
+  continues to work. Attribute access on `xhtml` / `markdown` /
+  `attachments` / `warnings` / `document` is unaffected.
+- cfxmark is now silent by default. Progress output, upload traces,
+  and security rejections log to `logging.getLogger("cfxmark")` —
+  enable with `logging.getLogger("cfxmark").setLevel("INFO")`.
+- No other runtime behavior changed. Core API (`to_cfx`, `to_md`,
+  `canonicalize_cfx`, `normalize_md`) is identical.
+
 ## [0.1.4] — 2026-04-08
 
 ### Tests

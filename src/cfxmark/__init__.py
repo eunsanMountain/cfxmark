@@ -6,10 +6,11 @@ from cfxmark.api import (
     ConversionOptions,
     ConversionResult,
     to_cfx,
+    to_jira_wiki,
     to_md,
 )
 from cfxmark.assets import AssetFetcher, ResolveMode, resolve_assets
-from cfxmark.exceptions import CfxmarkError, ConversionError, MacroError, ParseError
+from cfxmark.exceptions import AssetSecurityError, CfxmarkError, ConversionError, MacroError, ParseError
 from cfxmark.macros import MacroRegistry, default_registry
 from cfxmark.normalize import canonicalize_cfx, normalize_md
 
@@ -19,10 +20,12 @@ __all__ = [
     "ConversionResult",
     "DEFAULT_OPTIONS",
     "to_cfx",
+    "to_jira_wiki",
     "to_md",
     "AssetFetcher",
     "ResolveMode",
     "resolve_assets",
+    "AssetSecurityError",
     "CfxmarkError",
     "ConversionError",
     "MacroError",

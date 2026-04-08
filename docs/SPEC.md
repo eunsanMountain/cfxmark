@@ -150,11 +150,11 @@ edit the markers. It is invisible in any Markdown viewer.
   silently re-interpreted as an opaque block; the verification fails
   and the region falls back to plain text.
 
-## Known v0.1 limitations
+## Known limitations (as of v0.2)
 
 * **Macro handler API leaks lxml.** Custom `MacroHandler`
   implementations receive and return `lxml.etree._Element` objects
-  directly. A thin `MacroBody` adapter is planned for v0.2.
+  directly. A thin `MacroBody` adapter is planned for v0.3.
 * **HTML comments in Markdown** are dropped with a warning, with the
   exception of cfxmark's own opaque / asset / header markers.
   Confluence drops them on save anyway.

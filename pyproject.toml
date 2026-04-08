@@ -1,6 +1,6 @@
 [project]
 name = "cfxmark"
-version = "0.1.4"
+version = "0.2.0"
 description = "Bidirectional Markdown <-> Confluence Storage XHTML converter with lossless opaque preservation."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,7 +17,7 @@ keywords = [
     "round-trip",
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
@@ -37,6 +37,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+confluence = []  # Namespace-only extra — zero third-party runtime deps.
+                 # See README "Install" for rationale.
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",

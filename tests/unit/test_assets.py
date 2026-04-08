@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
 import cfxmark
+from cfxmark import AssetSecurityError
 
 PNG_BYTES = bytes.fromhex(
     "89504e470d0a1a0a"  # PNG signature
@@ -183,3 +185,67 @@ def test_resolve_assets_sidecar_requires_asset_dir() -> None:
     md = cfxmark.to_md(cfx).markdown
     with pytest.raises(ValueError, match="asset_dir"):
         cfxmark.resolve_assets(md, fetcher_returning(PNG_BYTES), mode="sidecar")
+
+
+# ---------------------------------------------------------------------------
+# strict_filenames path traversal defense (§3.1.4)
+# ---------------------------------------------------------------------------
+
+BAD_CASES = [
+    ("../../../etc/passwd", "parent traversal"),
+    ("/absolute/path.png", "absolute"),
+    ("C:\\windows\\system32.dll", "windows"),
+    ("stream:colon.png", "colon"),
+    ("null\x00byte.png", "null byte"),
+    ("..", "parent traversal alone"),
+    ("subdir/../escape.png", "subdir parent traversal"),
+]
+
+
+@pytest.mark.parametrize("bad_name,_label", BAD_CASES)
+def test_strict_filenames_rejects(bad_name: str, _label: str, tmp_path: Path) -> None:
+    # Marker must be on same line as image link (no newline between them)
+    md = f'![x]({bad_name}) <!-- cfxmark:asset src="{bad_name}" -->'
+    with pytest.raises(AssetSecurityError):
+        cfxmark.resolve_assets(md, lambda n: b"data", mode="sidecar", asset_dir=tmp_path)
+
+
+def test_strict_filenames_allows_legitimate(tmp_path: Path) -> None:
+    md = '![x](legitimate.png) <!-- cfxmark:asset src="legitimate.png" -->'
+    cfxmark.resolve_assets(md, fetcher_returning(PNG_BYTES), mode="sidecar", asset_dir=tmp_path)
+    assert (tmp_path / "legitimate.png").exists()
+
+
+def test_strict_filenames_allows_subdir(tmp_path: Path) -> None:
+    (tmp_path / "subdir").mkdir(exist_ok=True)
+    md = '![x](subdir/nested.png) <!-- cfxmark:asset src="subdir/nested.png" -->'
+    cfxmark.resolve_assets(md, fetcher_returning(PNG_BYTES), mode="sidecar", asset_dir=tmp_path)
+    assert (tmp_path / "subdir" / "nested.png").exists()
+
+
+def test_strict_filenames_allows_unicode(tmp_path: Path) -> None:
+    md = '![x](한국어.png) <!-- cfxmark:asset src="한국어.png" -->'
+    cfxmark.resolve_assets(md, fetcher_returning(PNG_BYTES), mode="sidecar", asset_dir=tmp_path)
+    assert (tmp_path / "한국어.png").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="symlink trap requires POSIX")
+def test_strict_filenames_rejects_symlink_escape(tmp_path: Path) -> None:
+    (tmp_path / "evil").symlink_to("/etc")
+    md = '![x](evil/passwd) <!-- cfxmark:asset src="evil/passwd" -->'
+    with pytest.raises(AssetSecurityError):
+        cfxmark.resolve_assets(md, lambda n: b"data", mode="sidecar", asset_dir=tmp_path)
+
+
+def test_strict_filenames_false_is_permissive(tmp_path: Path) -> None:
+    md = '![x](../evil.png) <!-- cfxmark:asset src="../evil.png" -->'
+    try:
+        cfxmark.resolve_assets(
+            md,
+            fetcher_returning(PNG_BYTES),
+            mode="sidecar",
+            asset_dir=tmp_path,
+            strict_filenames=False,
+        )
+    except AssetSecurityError:
+        pytest.fail("strict_filenames=False should bypass validation")

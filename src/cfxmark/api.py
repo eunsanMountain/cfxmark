@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import Literal
 
 from cfxmark.ast import Document
 from cfxmark.macros import MacroRegistry, default_registry
@@ -93,6 +94,7 @@ class ConversionResult:
     attachments: tuple[str, ...] = field(default_factory=tuple)
     warnings: tuple[str, ...] = field(default_factory=tuple)
     document: Document | None = None
+    jira_wiki: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -181,10 +183,89 @@ def to_md(
     )
 
 
+# ---------------------------------------------------------------------------
+# Jira wiki markup
+# ---------------------------------------------------------------------------
+
+_XHTML_UNAMBIGUOUS_RE = re.compile(r'^<[^>]+xmlns(:[a-z]+)?="')
+
+
+def _resolve_input_format(
+    source: str,
+    hint: Literal["auto", "markdown", "xhtml"],
+    warnings: list[str],
+) -> str:
+    if hint != "auto":
+        return hint
+    s = source.lstrip()
+    if s.startswith(("<?xml", "<!DOCTYPE", "<ac:", "<ri:")):
+        return "xhtml"
+    if _XHTML_UNAMBIGUOUS_RE.match(s):
+        return "xhtml"
+    if s.startswith("<"):
+        warnings.append(
+            "input_format=auto: source starts with '<' but no Confluence-specific "
+            "tokens matched; defaulting to markdown. Pass input_format=\"markdown\" "
+            "or input_format=\"xhtml\" to be explicit."
+        )
+        return "markdown"
+    return "markdown"
+
+
+def to_jira_wiki(
+    source: str,
+    *,
+    input_format: Literal["auto", "markdown", "xhtml"] = "auto",
+    section: str | None = None,
+    drop_leading_notice: tuple[re.Pattern[str], ...] = (),
+    macros: MacroRegistry | None = None,
+) -> ConversionResult:
+    """Convert Markdown or Confluence XHTML to Jira wiki markup.
+
+    :param source: Source text (Markdown or Confluence Storage XHTML).
+    :param input_format: ``"auto"`` (default), ``"markdown"``, or
+        ``"xhtml"``. Auto-detect uses a narrow set of tokens to
+        identify Confluence XHTML; ambiguous ``<tag>`` input defaults
+        to markdown with a warning.
+    :param section: If set, only the content of the first H2 section
+        whose title equals this string is rendered. ``jira_wiki`` will
+        be ``None`` if the section is not found.
+    :param drop_leading_notice: If the first block is a paragraph
+        whose flattened text matches any of these patterns, it is
+        silently removed before rendering.
+    :param macros: Macro registry. Defaults to
+        :data:`cfxmark.macros.default_registry`.
+    :returns: A :class:`ConversionResult` with ``jira_wiki``,
+        ``warnings`` and ``document`` populated.
+    """
+    from cfxmark.renderers.jira_wiki import render_jira_wiki
+
+    registry = macros or default_registry
+    warnings: list[str] = []
+    fmt = _resolve_input_format(source, input_format, warnings)
+    if fmt == "xhtml":
+        document, parse_warnings = parse_cfx(source, registry=registry)
+    else:
+        document, parse_warnings = parse_md(source, registry=registry)
+    warnings.extend(parse_warnings)
+    wiki_out, render_warnings = render_jira_wiki(
+        document,
+        section=section,
+        drop_leading_notice=drop_leading_notice,
+    )
+    warnings.extend(render_warnings)
+    return ConversionResult(
+        jira_wiki=wiki_out,
+        warnings=tuple(warnings),
+        document=document,
+    )
+
+
 __all__ = [
     "ConversionOptions",
     "ConversionResult",
     "DEFAULT_OPTIONS",
     "to_cfx",
     "to_md",
+    "to_jira_wiki",
 ]

@@ -17,10 +17,15 @@ result.warnings       # tuple  — human-readable conversion warnings
 result = cfxmark.to_md(xhtml_text)
 result.markdown       # str    — canonical markdown
 result.warnings       # tuple
+
+# Markdown or Confluence XHTML → Jira wiki markup
+result = cfxmark.to_jira_wiki(markdown_text)
+result.jira_wiki      # str | None — Jira wiki markup
 ```
 
-`ConversionResult` is the same dataclass for both directions —
-`xhtml` is populated for `to_cfx`, `markdown` for `to_md`.
+`ConversionResult` is the same dataclass for all directions —
+`xhtml` is populated for `to_cfx`, `markdown` for `to_md`,
+`jira_wiki` for `to_jira_wiki`.
 
 ## Why another converter?
 
@@ -46,13 +51,24 @@ both gaps:
 
 ## Install
 
+cfxmark ships in two modes:
+
 ```bash
+# Core: Markdown ↔ Confluence XHTML converter + Jira wiki renderer
+pip install cfxmark
+
 # With uv (recommended):
 uv add cfxmark
 
-# With pip:
-pip install cfxmark
+# With the optional Confluence REST client (zero additional deps —
+# the extra is namespace-only and reserves a stable upgrade slot):
+pip install 'cfxmark[confluence]'
 ```
+
+The `confluence` extra declares zero third-party runtime dependencies —
+`from cfxmark.confluence import ConfluenceClient` works even without it.
+The extra exists to signal intent in requirements files and to reserve a
+stable upgrade slot for future convenience helpers.
 
 cfxmark depends on `lxml` and `mistletoe`. Python 3.10+.
 
@@ -252,7 +268,7 @@ result = cfxmark.to_md(xhtml, macros=my_registry)
 Implementing a `MacroHandler` from scratch requires a small amount
 of lxml knowledge — see `cfxmark/macros/builtins/admonition.py` for
 a complete example. A higher-level handler API that hides lxml is
-planned for v0.2.
+planned for v0.3.
 
 ### Canonicalization helpers
 
@@ -313,6 +329,106 @@ word-boundary rule).
 If you only push `normalize_md(text)` rather than raw hand-edits,
 the `canonicalize_cfx` diff above stays stable across collaborators.
 
+### Jira wiki output
+
+`to_jira_wiki` converts Markdown or Confluence storage XHTML to Jira
+wiki markup. It accepts the same source formats as `to_cfx` / `to_md`
+and auto-detects which format it received.
+
+```python
+import cfxmark
+
+result = cfxmark.to_jira_wiki(markdown_text)
+print(result.jira_wiki)   # h2. Heading\n\n*bold* text …
+```
+
+Two optional parameters cover common push-pipeline patterns:
+
+```python
+import re
+
+# Only render the body of the first H2 section titled "Summary".
+result = cfxmark.to_jira_wiki(markdown_text, section="Summary")
+
+# Drop a leading cfxmark:notice comment before rendering
+# (useful when pushing a round-tripped Confluence page to Jira).
+result = cfxmark.to_jira_wiki(
+    markdown_text,
+    drop_leading_notice=(re.compile(r"cfxmark:notice"),),
+)
+```
+
+`result.jira_wiki` is `None` when `section=` is specified but not
+found in the document.
+
+## Confluence client (optional extra)
+
+Install with the `confluence` extra to signal intent — the client
+itself is always importable because it is built on Python's standard
+library:
+
+```bash
+pip install 'cfxmark[confluence]'
+```
+
+The extra declares **zero additional runtime dependencies**. It exists to:
+1. Signal the dependency in your `requirements.txt` / `pyproject.toml`
+   so readers see that you rely on the optional subsystem.
+2. Reserve a stable upgrade slot — if future convenience helpers
+   (credential stores, rich CLI) gain third-party deps, the extra is
+   the place they'll land.
+
+```python
+from cfxmark.confluence import ConfluenceClient, BearerTokenFile
+
+client = ConfluenceClient(
+    host="https://confluence.example.com",
+    auth=BearerTokenFile("~/.secrets/confluence_pat"),
+    dialect="server",
+)
+
+# Canonical-aware push — skips the REST PUT entirely when the remote
+# body is byte-equivalent to the rendered local Markdown.
+result = client.push_markdown(
+    page_id="12345",
+    md_text=my_markdown,
+    md_path="docs/my_page.md",
+    on_conflict="abort",
+)
+if result.changed:
+    print(f"Pushed. Uploaded {len(result.uploaded_attachments)} new attachments.")
+    if result.has_partial_failure:
+        for name, ex in result.failed_attachments:
+            print(f"  ! attachment {name} failed: {ex!r}")
+else:
+    print("No-op; remote is already current.")
+
+# Canonical-aware pull with resolved assets in a sidecar directory.
+pull = client.pull_markdown(
+    page_id="12345",
+    md_path="docs/my_page.md",
+    resolve_assets_mode="sidecar",
+    asset_dir="docs/my_page-assets",
+)
+```
+
+**Logging.** The client uses `logging.getLogger("cfxmark.confluence")`
+exclusively — no direct writes to `sys.stdout` or `sys.stderr`.
+Enable progress output with:
+
+```python
+import logging
+logging.getLogger("cfxmark").setLevel(logging.INFO)
+```
+
+**Confluence dialect.** The default is `dialect="server"` because
+Confluence Server / Data Center is the reference test target.
+Confluence Cloud users should pass `dialect="cloud"` — the
+`X-Atlassian-Token: no-check` XSRF bypass header (mandatory on
+Server, unsupported on Cloud) is gated on this setting. Cloud support
+is best-effort; if you hit a Cloud-only regression, please open an
+issue.
+
 ## Security
 
 cfxmark hardens its XML parser against XXE and billion-laughs attacks:
@@ -326,6 +442,35 @@ cfxmark hardens its XML parser against XXE and billion-laughs attacks:
   block.
 
 If you find a security issue, please open a GitHub issue.
+
+## Stability contract
+
+The following names are covered by semantic versioning and will not be
+removed or incompatibly changed without a major version bump:
+
+**`cfxmark` package** — `to_cfx`, `to_md`, `to_jira_wiki`,
+`canonicalize_cfx`, `normalize_md`, `resolve_assets`,
+`ConversionResult`, `ConversionOptions`, `DEFAULT_OPTIONS`,
+`AssetFetcher`, `ResolveMode`, `CfxmarkError`, `ConversionError`,
+`MacroError`, `ParseError`, `AssetSecurityError`, `MacroRegistry`,
+`default_registry`.
+
+**`cfxmark.confluence`** — `ConfluenceClient`, `PushResult`,
+`PullResult`, `Auth`, `BearerToken`, `BearerTokenFile`, `BasicAuth`,
+`EnvBearerToken`, `HTTPError`, `ConfluenceVersionConflict`.
+
+Guarantees:
+- Breaking changes bump the minor version for 0.x.y releases.
+- `canonicalize_cfx` normalization rules are cumulative — each release
+  is a strict superset of the previous release's canonicalization.
+- Deprecations are announced one minor version before removal.
+
+Not covered: underscore-prefixed symbols, `parsers.*` / `renderers.*` /
+`ast.*` internals, logging message wording, `ConversionResult.document`
+AST shape, warning message wording.
+
+Note: 0.x.y versioning is looser than 1.x.y — minor version bumps may
+carry breaking changes as noted above.
 
 ## Development
 

@@ -4,7 +4,7 @@ requires-python = ">=3.10"
 
 [[package]]
 name = "cfxmark"
-version = "0.1.4"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "lxml" },
@@ -32,7 +32,7 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["confluence", "dev"]
 
 [[package]]
 name = "colorama"

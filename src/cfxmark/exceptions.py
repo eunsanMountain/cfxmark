@@ -30,3 +30,12 @@ class MacroError(CfxmarkError):
     * Missing required parameter
     * Forward or reverse function raised an unexpected error
     """
+
+
+class AssetSecurityError(CfxmarkError):
+    """Raised when ``resolve_assets`` rejects an unsafe attachment filename."""
+
+    def __init__(self, name: str, reason: str) -> None:
+        self.name = name
+        self.reason = reason
+        super().__init__(f"unsafe attachment filename {name!r}: {reason}")
