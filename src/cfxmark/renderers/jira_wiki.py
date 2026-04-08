@@ -97,9 +97,6 @@ _HEADING_PROMOTION_TABLES: dict[str, dict[int, int]] = {
     "jira": _HEADING_PROMOTION_JIRA,
     "none": _HEADING_PROMOTION_JIRA,
 }
-# Kept for backward compatibility with any external caller that
-# imported the old constant directly.
-_HEADING_PROMOTION = _HEADING_PROMOTION_CONFLUENCE
 
 
 @dataclass
@@ -197,14 +194,13 @@ def _render_list(node: List, ctx: JiraWikiContext, marker_prefix: str = "") -> s
 
 def _render_block(node: BlockNode, ctx: JiraWikiContext) -> str:
     if isinstance(node, Heading):
-        # Heading mapping depends on ``ctx.heading_promotion``:
-        # ``confluence`` (default) collapses H3→h2 for page-title
-        # stripping; ``jira``/``none`` use the identity mapping so
-        # that a Jira issue description preserves author intent.
-        table = _HEADING_PROMOTION_TABLES.get(
-            ctx.heading_promotion, _HEADING_PROMOTION_CONFLUENCE
-        )
-        promoted = table[node.level]
+        # ``ctx.heading_promotion`` is validated once in
+        # :func:`render_jira_wiki`; a direct ``[]`` lookup is safe
+        # here. ``confluence`` (default) collapses H3→h2 for
+        # Confluence-page semantics; ``jira``/``none`` use the
+        # identity mapping so a Jira issue description preserves
+        # the author's heading levels.
+        promoted = _HEADING_PROMOTION_TABLES[ctx.heading_promotion][node.level]
         return f"h{promoted}. {_render_inline(node.children, ctx)}"
     if isinstance(node, Paragraph):
         return _render_inline(node.children, ctx)

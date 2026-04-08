@@ -308,15 +308,16 @@ def _build_passthrough_open_re(
     """Build a regex matching the *opening line* of an HTML comment
     whose first non-whitespace token starts with one of ``prefixes``.
 
-    Returns ``None`` when no eligible prefix is configured. ``cfxmark:``
-    prefixes are filtered out so cfxmark's own sentinel comments
-    cannot be hijacked into a passthrough capture.
+    Returns ``None`` when no eligible prefix remains after the
+    ``cfxmark:`` filter in
+    :func:`cfxmark.normalize._safe_passthrough_alternation`.
     """
 
-    safe = tuple(p for p in prefixes if not p.startswith("cfxmark:"))
-    if not safe:
+    from cfxmark.normalize import _safe_passthrough_alternation
+
+    alternation = _safe_passthrough_alternation(prefixes)
+    if alternation is None:
         return None
-    alternation = "|".join(re.escape(p) for p in safe)
     return re.compile(r"^[ \t]*<!--\s*(?:" + alternation + r")")
 
 
@@ -330,12 +331,10 @@ class _MdConverter:
         self,
         pre: _PreprocessResult,
         registry: MacroRegistry,
-        passthrough_html_comment_prefixes: tuple[str, ...] = (),
     ) -> None:
         self.pre = pre
         self.registry = registry
         self.warnings: list[str] = []
-        self.passthrough_html_comment_prefixes = passthrough_html_comment_prefixes
 
     # ---- block-level ------------------------------------------------------
 
@@ -402,13 +401,7 @@ class _MdConverter:
         md_doc = MdDocument(source)
         # Hand the inner walker the *outer* preprocess state so
         # placeholder lookups continue to work.
-        inner = _MdConverter(
-            pre=self.pre,
-            registry=self.registry,
-            passthrough_html_comment_prefixes=(
-                self.passthrough_html_comment_prefixes
-            ),
-        )
+        inner = _MdConverter(pre=self.pre, registry=self.registry)
         document = inner.convert_document(md_doc)
         self.warnings.extend(inner.warnings)
         return document.children
@@ -899,7 +892,6 @@ def parse_md(
         converter = _MdConverter(
             pre=pre,
             registry=registry or default_registry,
-            passthrough_html_comment_prefixes=passthrough_html_comment_prefixes,
         )
         document = converter.convert_document(md_doc)
     except Exception as ex:  # pragma: no cover — defensive

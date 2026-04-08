@@ -306,7 +306,6 @@ def from_jira_wiki(
     source: str,
     *,
     options: ConversionOptions | None = None,
-    macros: MacroRegistry | None = None,
 ) -> ConversionResult:
     """Parse Jira wiki markup and re-emit it as canonical Markdown.
 
@@ -325,8 +324,6 @@ def from_jira_wiki(
         Style fields (``bullet_marker``, ``code_fence``) apply; the
         ``passthrough_html_comment_prefixes`` field is ignored
         because Jira wiki has no HTML comment syntax.
-    :param macros: Macro registry to use. Defaults to
-        :data:`cfxmark.macros.default_registry`.
     :returns: A :class:`ConversionResult` with ``markdown``,
         ``warnings``, ``attachments`` and ``document`` populated.
         ``attachments`` lists every ``[^filename]`` / ``!file!``
@@ -335,7 +332,6 @@ def from_jira_wiki(
     """
 
     opts = options or DEFAULT_OPTIONS
-    registry = macros or default_registry
     if not source:
         return ConversionResult(
             markdown="",
@@ -343,9 +339,7 @@ def from_jira_wiki(
             attachments=(),
             document=Document(children=()),
         )
-    document, parse_warnings, attachments = parse_jira_wiki(
-        source, registry=registry
-    )
+    document, parse_warnings, attachments = parse_jira_wiki(source)
     markdown = render_md(document, options=opts.md_options())
     return ConversionResult(
         markdown=markdown,

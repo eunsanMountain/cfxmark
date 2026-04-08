@@ -77,7 +77,6 @@ from cfxmark.ast import (
     Text,
 )
 from cfxmark.exceptions import ParseError
-from cfxmark.macros import MacroRegistry, default_registry
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -136,7 +135,6 @@ _HORIZONTAL_RULE_RE = re.compile(r"^-{4,}\s*$")
 class _ParseContext:
     warnings: list[str] = field(default_factory=list)
     attachments: list[str] = field(default_factory=list)
-    registry: MacroRegistry = field(default_factory=lambda: default_registry)
 
     def add_attachment(self, filename: str) -> None:
         if filename and filename not in self.attachments:
@@ -385,8 +383,6 @@ def _try_parse_image(
         i += 1
     else:
         return None
-    if i >= n:
-        return None
     inner = text[start + 1 : i]
     next_i = i + 1
     if not _is_emphasis_right_boundary(text, next_i):
@@ -602,9 +598,19 @@ def _line_is_paired_macro_open(line: str) -> str | None:
     return None
 
 
-def _line_terminates_paragraph(line: str) -> bool:
+def _line_terminates_paragraph(
+    line: str,
+    *,
+    inside_table: bool = False,
+) -> bool:
     """Return ``True`` if *line* starts a new block and therefore
-    breaks an in-progress paragraph."""
+    breaks an in-progress paragraph.
+
+    ``inside_table=True`` disables the list / table-row checks —
+    a nested list inside a table cell is a legitimate Jira pattern,
+    and the table-row check is already handled upstream by the row
+    start detector.
+    """
     if not line.strip():
         return True
     if _line_is_heading(line):
@@ -613,10 +619,11 @@ def _line_terminates_paragraph(line: str) -> bool:
         return True
     if _line_is_blockquote(line):
         return True
-    if _line_is_list(line):
-        return True
-    if _line_is_table_row(line):
-        return True
+    if not inside_table:
+        if _line_is_list(line):
+            return True
+        if _line_is_table_row(line):
+            return True
     if _line_is_paired_macro_open(line) is not None:
         return True
     return False
@@ -1022,7 +1029,9 @@ def _consume_table(
         # different block. Without this guard the table greedily eats
         # trailing content like ``h3. *TO-BE*`` that happens to sit
         # right after the last row with no blank separator.
-        if row_sources and not _line_terminates_paragraph_strict(line):
+        if row_sources and not _line_terminates_paragraph(
+            line, inside_table=True
+        ):
             row_sources[-1] = row_sources[-1] + "\n" + line
             i += 1
             continue
@@ -1056,25 +1065,6 @@ def _consume_table(
         Table(header=header_row, body=tuple(body_rows), alignments=()),
         i,
     )
-
-
-def _line_terminates_paragraph_strict(line: str) -> bool:
-    """Like :func:`_line_terminates_paragraph` but also treats an empty
-    line as a terminator. Used by the table continuation check."""
-
-    if not line.strip():
-        return True
-    if _line_is_heading(line):
-        return True
-    if _line_is_hr(line):
-        return True
-    if _line_is_blockquote(line):
-        return True
-    if _line_is_paired_macro_open(line) is not None:
-        return True
-    # Lists are NOT treated as terminators here because a nested list
-    # inside a table cell is a legitimate Jira pattern.
-    return False
 
 
 def _build_table_row(
@@ -1171,15 +1161,11 @@ def _parse_blocks(source: str, ctx: _ParseContext) -> list[BlockNode]:
 
 def parse_jira_wiki(
     source: str,
-    *,
-    registry: MacroRegistry | None = None,
 ) -> tuple[Document, list[str], tuple[str, ...]]:
     """Parse a Jira wiki markup string into a cfxmark AST.
 
     :param source: Jira wiki markup text. Empty / ``None`` inputs
         produce an empty :class:`Document` without raising.
-    :param registry: Macro registry. Reserved for future unknown-
-        macro registration; currently unused.
     :returns: ``(document, warnings, attachments)``. ``attachments``
         is a tuple of filenames referenced via ``[^file]`` or
         ``!file!`` syntax, in document order and deduplicated, so
@@ -1188,7 +1174,7 @@ def parse_jira_wiki(
 
     if not source:
         return Document(children=()), [], ()
-    ctx = _ParseContext(registry=registry or default_registry)
+    ctx = _ParseContext()
     try:
         blocks = _parse_blocks(source, ctx)
     except Exception as exc:  # pragma: no cover — defensive

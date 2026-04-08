@@ -1161,6 +1161,30 @@ def normalize_md(source: str) -> str:
     return render_md(doc)
 
 
+def _safe_passthrough_alternation(
+    prefixes: tuple[str, ...],
+) -> str | None:
+    """Build a regex alternation (``re.escape``-joined) of the
+    caller-supplied passthrough prefixes, filtering out any
+    ``cfxmark:`` prefix so cfxmark's own sentinel comments cannot be
+    hijacked.
+
+    Returns ``None`` when no eligible prefix remains — the caller
+    should short-circuit in that case.
+
+    Single source of truth used by both
+    :func:`strip_passthrough_comments` (which matches the full
+    comment block) and
+    :func:`cfxmark.parsers.md._build_passthrough_open_re` (which
+    matches only the opening line of a multi-line comment).
+    """
+
+    safe = tuple(p for p in prefixes if not p.startswith("cfxmark:"))
+    if not safe:
+        return None
+    return "|".join(re.escape(p) for p in safe)
+
+
 def strip_passthrough_comments(
     source: str,
     prefixes: tuple[str, ...],
@@ -1184,10 +1208,9 @@ def strip_passthrough_comments(
         including any trailing blank line the comment owned.
     """
 
-    safe = tuple(p for p in prefixes if not p.startswith("cfxmark:"))
-    if not safe:
+    alternation = _safe_passthrough_alternation(prefixes)
+    if alternation is None:
         return source
-    alternation = "|".join(re.escape(p) for p in safe)
     # Match the comment plus any trailing whitespace run so the
     # surrounding blank line the comment owned is collapsed too —
     # otherwise stripping would leave stranded double newlines that

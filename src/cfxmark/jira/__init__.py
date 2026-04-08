@@ -33,15 +33,7 @@ Typical wrapper usage::
 
 from __future__ import annotations
 
-from cfxmark.api import to_jira_wiki
-
-# ``from_jira_wiki`` is added in P3 — this namespace reserves the
-# import path so wrappers can ``from cfxmark.jira import from_jira_wiki``
-# without churn once the parser lands.
-try:
-    from cfxmark.api import from_jira_wiki  # type: ignore[attr-defined]
-except ImportError:  # pragma: no cover — pre-P3 build
-    from_jira_wiki = None  # type: ignore[assignment]
+from cfxmark.api import from_jira_wiki, to_jira_wiki
 
 __all__ = [
     "to_jira_wiki",
