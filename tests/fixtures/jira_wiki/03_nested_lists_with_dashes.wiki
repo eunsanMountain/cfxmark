@@ -1,0 +1,38 @@
+h3. *Background*
+ * Configuration A uses sensor set S1
+ * Configuration A cannot support feature F
+ * Feature gating depends on sensor_config interface in the feature-coding layer, enabling F only when the 5-sensor variant is present
+
+h3. *AS-IS*
+ * State transition rules
+ ** OFF -> FAIL (AND)
+ *** system flag raised
+ *** user mode OFF
+
+h3. *TO-BE*
+ * State transition rules
+ ** OFF -> FAIL (AND)
+ *** system flag raised
+ *** user mode OFF
+ *** {color:#de350b}extra_gating == enabled{color}
+
+
+
+{color:#172b4d}Note: other transitions (e.g. OFF -> STANDBY) do not reference sensor config (mode stays OFF, so state stays OFF){color}
+h3. *Source*
+ * Internal spec v1.2
+ * Design review notes - rev10
+
+h3. *Plan*
+ * Master event: project M1 ([proj_M1_spec|https://example.com/pages/proj-m1-spec])
+ * Deploy target: per-version confirmation required
+ ** (internal team reference)
+ *** horizontal rollout across all variants
+
+h3. *Impact*
+ - Positive effect: feature availability aligned with hardware configuration
+ - Negative effect: N/A
+
+
+h3. *Tests*
+ * unit tests pass

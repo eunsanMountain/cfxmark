@@ -1,0 +1,8 @@
+h2. Behavior
+The pipeline processes input and produces canonical output with stable ordering across multiple runs, even when the upstream source reorders its own internal buffers.
+
+h2. Notes
+(Additional details — see design_notes.md)
+
+📚 *Reference*: [design page|https://example.com/pages/design]
+

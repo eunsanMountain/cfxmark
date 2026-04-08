@@ -21,11 +21,18 @@ result.warnings       # tuple
 # Markdown or Confluence XHTML → Jira wiki markup
 result = cfxmark.to_jira_wiki(markdown_text)
 result.jira_wiki      # str | None — Jira wiki markup
+
+# Jira wiki markup → Markdown  (EXPERIMENTAL, LOSSY — v0.3+)
+from cfxmark.jira import from_jira_wiki
+result = from_jira_wiki(jira_issue_description)
+result.markdown       # str
+result.attachments    # tuple  — filenames referenced via [^file] / !file!
+result.warnings       # tuple  — dropped colours, unsupported sub/sup/ins, …
 ```
 
 `ConversionResult` is the same dataclass for all directions —
-`xhtml` is populated for `to_cfx`, `markdown` for `to_md`,
-`jira_wiki` for `to_jira_wiki`.
+`xhtml` is populated for `to_cfx`, `markdown` for `to_md` /
+`from_jira_wiki`, and `jira_wiki` for `to_jira_wiki`.
 
 ## Why another converter?
 
@@ -429,6 +436,149 @@ Server, unsupported on Cloud) is gated on this setting. Cloud support
 is best-effort; if you hit a Cloud-only regression, please open an
 issue.
 
+## Jira wiki (experimental, lossy)
+
+The Confluence round-trip (`to_cfx` / `to_md`) is **lossless** after
+canonicalization — every construct in the supported subset
+round-trips byte-for-byte, and everything else is preserved through
+the opaque-block mechanism. The Jira wiki direction is **not**. Jira
+wiki markup is a looser dialect without opaque-macro identity
+preservation, and several constructs have no equivalent on the
+Markdown side.
+
+Keep the two contracts at different import sites so the asymmetry is
+visible:
+
+```python
+from cfxmark import to_cfx, to_md           # lossless, Confluence side
+from cfxmark.jira import from_jira_wiki, to_jira_wiki  # experimental
+```
+
+### Contract
+
+The strongest guarantee the Jira pipeline offers is:
+
+> `from_jira_wiki(jira_wiki)` produces a :class:`ConversionResult` whose
+> Markdown representation reaches a **fixed point** after at most two
+> `wiki → md → wiki` iterations. Pass 1 (`wiki → md`) is a one-way
+> canonicalization; pass 2 (`md → wiki → md`) must be idempotent. The
+> real-world fixture corpus (6 Jira issue descriptions drawn from
+> production) is exercised in `tests/unit/test_jira_wiki_parser.py`
+> to pin this contract.
+
+Explicitly **allowed** canonicalization (not considered a diff):
+
+- Heading spacing, list indent, trailing whitespace normalisation
+- Soft-break inside a paragraph collapsed into a single line
+- Jira colour emphasis (`{color:#hex}text{color}`) dropped; content kept
+- Jira `{panel}` macro mapped to `{note}` admonition
+- `_italic_` canonicalised to Markdown `*italic*`
+- `-strike-` canonicalised to Markdown `~~strike~~`
+- `~sub~` / `+ins+` / `^sup^` dropped with markers removed, content kept
+
+Explicitly **forbidden** (would break the contract):
+
+- Content loss inside headings, paragraphs, list items, code blocks
+- Re-ordering of top-level blocks
+- URL rewriting in links
+- Renaming attachments (filenames in `[^file]` / `!file!` are preserved
+  verbatim in `ConversionResult.attachments`)
+
+### Lossy mapping table
+
+| Jira wiki                    | Markdown                                | Note                                     |
+|------------------------------|------------------------------------------|------------------------------------------|
+| `h1.`…`h6.`                  | `#`…`######`                             | 1:1 identity (no promotion on parse)     |
+| `*bold*`                     | `**bold**`                               | boundary-aware                           |
+| `_italic_`                   | `*italic*`                               |                                          |
+| `-strike-`                   | `~~strike~~`                             | boundary-aware                           |
+| `{{mono}}`                   | `` `mono` ``                             |                                          |
+| `~sub~`, `+ins+`, `^sup^`    | plain text                               | markers dropped, content kept + warning  |
+| `{color:#hex}x{color}`       | `x`                                      | colour dropped + warning                 |
+| `[url]`                      | `[url](url)` (empty label form)          |                                          |
+| `[label\|url]`               | `[label](url)`                           | label may contain nested `[...]`         |
+| `[^file.png]`                | `![](file.png)`                          | when extension is image-like             |
+| `[^file.msg]`                | `[file.msg](attachment:file.msg)`        | otherwise                                |
+| `[~user]`                    | *(dropped)*                              | warning recorded                         |
+| `{code:python}body{code}`    | ` ```python\nbody\n``` `                 |                                          |
+| `{noformat}body{noformat}`   | ` ```\nbody\n``` `                       |                                          |
+| `{quote}body{quote}`, `bq.`  | `> body`                                 |                                          |
+| `{info}`/`{note}`/`{warning}`/`{tip}` | `> [!INFO]` callout             | GitHub / Obsidian style                  |
+| `{panel:title=X}body{panel}` | `> [!NOTE] X` + warning                  | D4 mapping                               |
+| `h3. *Title*`                | `### **Title**`                          | literal nested bold preserved            |
+| Multi-line table cell        | GFM cell with `<br>` soft break          |                                          |
+| `\|\|h1\|\|h2\|\|` header row | GFM header row                          |                                          |
+| `----`                       | `---`                                    |                                          |
+
+Warnings accumulate on `ConversionResult.warnings`; fixture tests in
+`tests/unit/test_jira_wiki_parser.py` pin the behaviour of every
+entry in this table.
+
+### Heading promotion on the output side
+
+`to_jira_wiki` has a `heading_promotion` keyword that controls the
+heading level mapping:
+
+- `"confluence"` *(default)* — Markdown H3 collapses to Jira `h2`
+  (and H4 → `h3`, …). Use when the Jira wiki output will be pushed
+  to a **Confluence page** whose title already occupies the top slot.
+- `"jira"` — identity mapping. Use when the output is pushed to a
+  **Jira issue description**, because the issue title lives in a
+  separate field and the body can start at `h1`.
+- `"none"` — alias for `"jira"`.
+
+```python
+from cfxmark import to_jira_wiki
+
+# Confluence push — historical default
+to_jira_wiki(md)
+
+# Jira issue description push
+to_jira_wiki(md, heading_promotion="jira")
+```
+
+### HTML comment passthrough (wrapper metadata)
+
+If your wrapper embeds caller-owned metadata as HTML comments in the
+local Markdown file — for example a workflow manifest:
+
+```markdown
+# My feature
+
+<!-- workflow:meta
+  key: TASK-42
+  type: Story
+  last_synced_version: 15
+-->
+
+body...
+```
+
+— opt in via `ConversionOptions.passthrough_html_comment_prefixes`.
+Matching comments are preserved verbatim across `parse_md` /
+`render_md`, and silently dropped by `to_cfx` / `to_jira_wiki` so
+they never leak to Confluence or Jira:
+
+```python
+from cfxmark import ConversionOptions, to_cfx, to_md
+from cfxmark.normalize import strip_passthrough_comments
+
+opts = ConversionOptions(
+    passthrough_html_comment_prefixes=("workflow:",)
+)
+
+# Push: comment is dropped on the way to Confluence
+result = to_cfx(local_md, options=opts)
+
+# Canonical compare: strip comments on both sides before diffing
+left = strip_passthrough_comments(local_md, ("workflow:",))
+right = strip_passthrough_comments(pulled_md, ("workflow:",))
+assert left == right
+```
+
+`cfxmark:` prefixes are filtered out so cfxmark's own sentinel
+comments (`cfxmark:opaque`, `cfxmark:notice`) cannot be hijacked.
+
 ## Security
 
 cfxmark hardens its XML parser against XXE and billion-laughs attacks:
@@ -449,11 +599,19 @@ The following names are covered by semantic versioning and will not be
 removed or incompatibly changed without a major version bump:
 
 **`cfxmark` package** — `to_cfx`, `to_md`, `to_jira_wiki`,
-`canonicalize_cfx`, `normalize_md`, `resolve_assets`,
-`ConversionResult`, `ConversionOptions`, `DEFAULT_OPTIONS`,
-`AssetFetcher`, `ResolveMode`, `CfxmarkError`, `ConversionError`,
-`MacroError`, `ParseError`, `AssetSecurityError`, `MacroRegistry`,
-`default_registry`.
+`from_jira_wiki`, `canonicalize_cfx`, `normalize_md`,
+`strip_passthrough_comments`, `resolve_assets`, `ConversionResult`,
+`ConversionOptions`, `DEFAULT_OPTIONS`, `AssetFetcher`, `ResolveMode`,
+`CfxmarkError`, `ConversionError`, `MacroError`, `ParseError`,
+`AssetSecurityError`, `MacroRegistry`, `default_registry`.
+
+**`cfxmark.jira`** — `to_jira_wiki`, `from_jira_wiki`.
+**Experimental in v0.3**: the Jira parser contract is "converges
+after at most three `wiki → md → wiki` iterations", not
+byte-identical. The top-level `to_jira_wiki`, `from_jira_wiki`, and
+`ConversionResult.jira_wiki` field ARE stable — only the quality
+of the round-trip itself is experimental. See the "Jira wiki
+(experimental, lossy)" section above for the full contract.
 
 **`cfxmark.confluence`** — `ConfluenceClient`, `PushResult`,
 `PullResult`, `Auth`, `BearerToken`, `BearerTokenFile`, `BasicAuth`,

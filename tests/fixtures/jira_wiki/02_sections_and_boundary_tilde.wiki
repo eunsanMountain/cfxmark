@@ -1,0 +1,32 @@
+h2. Direction
+
+Implement the rollout v1.0~v2.0 with incremental validation (no behavioural change — process-focused)
+
+h2. Background
+
+Previous iteration focused on offline validation.
+Current phase extends to live environments with staged rollout,
+plus a feedback loop applied to each integration window.
+
+h2. Approach
+
+Define targets + phases + validation gates + feedback loop
+
+h2. Success criteria
+
+Three consecutive phases pass without regression in all tracked metrics
+
+h2. Dependencies
+* Previous phase completed
+* Hardware budget approved (~next quarter)
+
+h2. Milestones
+
+~end of quarter: integration checkpoint reached + qualitative sign-off complete
+
+h2. Schedule
+
+week 1~week 8
+
+📚 *Reference*: [milestones page|https://example.com/pages/milestones]
+

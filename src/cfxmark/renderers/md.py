@@ -43,6 +43,7 @@ from cfxmark.ast import (
     ListType,
     OpaqueBlock,
     Paragraph,
+    PassthroughComment,
     SoftBreak,
     Strikethrough,
     Strong,
@@ -361,6 +362,12 @@ def _render_block(block: BlockNode, opts: MarkdownRenderOptions) -> str:
         return _render_directive(block, opts)
     if isinstance(block, OpaqueBlock):
         return serialize_opaque(block.raw_xml, block.opaque_id)
+    if isinstance(block, PassthroughComment):
+        # Caller-owned HTML comment — emit verbatim. The content
+        # already includes the ``<!--`` / ``-->`` sentinels so the
+        # renderer simply echoes it as its own block with the normal
+        # surrounding blank lines that ``_render_blocks`` provides.
+        return block.content
     raise TypeError(f"unexpected block node: {type(block).__name__}")
 
 

@@ -287,6 +287,26 @@ class OpaqueBlock(Node):
     opaque_id: str
 
 
+@dataclass(frozen=True)
+class PassthroughComment(Node):
+    """A HTML comment that lives on the Markdown side only.
+
+    Used for caller-owned metadata blocks like
+    ``<!-- workflow:meta ... -->`` which must survive a Markdown
+    round-trip but must NOT be serialized to Confluence or Jira (they
+    are not document content). The Markdown parser captures them when
+    the caller opts in via
+    :attr:`ConversionOptions.passthrough_html_comment_prefixes`; the
+    Markdown renderer emits them verbatim; CFX and Jira wiki renderers
+    drop them silently.
+
+    ``content`` is the full comment text including the ``<!--`` and
+    ``-->`` sentinels, so the renderer can echo it byte-for-byte.
+    """
+
+    content: str
+
+
 BlockNode = (
     Heading
     | Paragraph
@@ -298,6 +318,7 @@ BlockNode = (
     | Table
     | DirectiveMacro
     | OpaqueBlock
+    | PassthroughComment
 )
 
 
@@ -348,6 +369,7 @@ __all__ = [
     "Table",
     "DirectiveMacro",
     "OpaqueBlock",
+    "PassthroughComment",
     "BlockNode",
     "Document",
     "AnyNode",

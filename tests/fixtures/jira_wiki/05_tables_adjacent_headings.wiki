@@ -1,0 +1,50 @@
+h3. *Background*
+
+Specification was missed during the internal logic discussion stage.
+
+When Current Info transitions from Operational to Non-operational, the original spec forced the mode to OFF (no Active / Ready / Standby), but the revised spec allows Standby to persist (no Active / Ready).
+
+h3. *AS-IS*
+
+When Current Info changes from the table's Operational values to any Non-operational value, the mode transitions to {color:#de350b}*OFF*{color}
+|*Signal*|*Value*|*Description*|*Note*|
+|FLAG_A|0x1|VAL1|context one|
+| |0x2|VAL2|context two|
+|FLAG_B|0x1|MAIN|primary state|
+|FLAG_C|0x0, or 0x1|None, or AltExit|state none, or
+right after an alt exit|
+|FLAG_D|0x0, or 0x1|None, or ExitVal|state none, or right after exit|
+|FLAG_E|0x2|Normal|normal operation|
+|FLAG_F|0x1|2 or more|more than one active lane|
+h3. *TO-BE*
+
+When Current Info changes from the table's Operational values to any Non-operational value, the mode *{color:#4c9aff}Active and Ready are not reachable.{color}*
+|*Signal*|*Value*|*Description*|*Note*|
+|FLAG_A|0x1|VAL1|context one|
+| |0x2|VAL2|context two|
+|FLAG_B|0x1|MAIN|primary state|
+|FLAG_C|0x0, or 0x1|None, or AltExit|state none, or
+right after an alt exit|
+|FLAG_D|0x0, or 0x1|None, or ExitVal|state none, or right after exit|
+|FLAG_E|0x2|Normal|normal operation|
+|FLAG_F|0x1|2 or more|more than one active lane|
+h3. *Source*
+
+Internal source
+
+[spec_document_rev1.docx|https://example.com/download/attachments/spec_document_rev1.docx?version=2&api=v2]
+h3. *Plan*
+
+Master event: [release_v1 temp4|https://example.com/pages/release-v1]
+
+Application event: all variants
+
+h3. *Impact*
+
+Positive effect: faster transition back to a valid state when conditions allow
+
+Negative effect: risk of a false positive under anomalous input
+
+h3. *Tests*
+
+-

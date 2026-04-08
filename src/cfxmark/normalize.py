@@ -1161,8 +1161,47 @@ def normalize_md(source: str) -> str:
     return render_md(doc)
 
 
+def strip_passthrough_comments(
+    source: str,
+    prefixes: tuple[str, ...],
+) -> str:
+    """Remove caller-owned HTML comment blocks from a Markdown string.
+
+    The wrapper's canonical-compare workflow needs to diff two Markdown
+    documents while ignoring any comment whose first token starts with
+    one of ``prefixes`` — those comments are local metadata managed
+    by the wrapper (``<!-- workflow:meta ... -->`` and friends), and
+    they are known to exist on the local side but never survive a
+    push-pull round trip through cfxmark (R1 contract).
+
+    ``cfxmark:`` prefixes are silently filtered out so callers cannot
+    accidentally strip cfxmark's own sentinel comments (``cfxmark:opaque``,
+    ``cfxmark:notice``, …) and break round-trip safety.
+
+    :param source: Markdown source text.
+    :param prefixes: Tuple of leading-word prefixes to strip.
+    :returns: The source with every matching comment block removed,
+        including any trailing blank line the comment owned.
+    """
+
+    safe = tuple(p for p in prefixes if not p.startswith("cfxmark:"))
+    if not safe:
+        return source
+    alternation = "|".join(re.escape(p) for p in safe)
+    # Match the comment plus any trailing whitespace run so the
+    # surrounding blank line the comment owned is collapsed too —
+    # otherwise stripping would leave stranded double newlines that
+    # diff-compare as noise.
+    pattern = re.compile(
+        r"<!--\s*(?:" + alternation + r").*?-->[ \t]*\n?",
+        re.DOTALL,
+    )
+    return pattern.sub("", source)
+
+
 __all__ = [
     "VOLATILE_ATTRS",
     "canonicalize_cfx",
     "normalize_md",
+    "strip_passthrough_comments",
 ]

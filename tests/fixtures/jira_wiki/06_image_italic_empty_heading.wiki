@@ -1,0 +1,21 @@
+h3. *Test scenario*
+
+Verification of the adaptive filter in a simulation environment
+* Target speed: 70 km/h
+* Target: stationary objects at various positions near the boundary
+* Lane width: 3.5 m
+* Scenario: scenario_test_01_basic
+
+h3. *Test results*
+
+!chart-1.png!
+* Offset of 15 cm activated when target position reaches -2.4 m
+* Offset of 30 cm activated when target position reaches -2.19 m
+* DecideOffset signal shows stable transitions without oscillation
+* No unnecessary toggling observed in the steady-state zone
+
+h3. *Conclusion*
+
+The filter successfully eliminates oscillation. Stable operation confirmed in the simulation environment.
+h2.
+_Draft content — review pending_

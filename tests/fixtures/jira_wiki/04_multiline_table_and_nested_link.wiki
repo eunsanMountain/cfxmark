@@ -1,0 +1,48 @@
+h3. *Overview*
+ * Module M operates in two modes sharing a single flag
+ ** Mode Alpha is always active when Mode Beta turns on
+ ** Disabling Alpha while Beta is active must raise a warning popup
+
+h3. *AS-IS*
+ * N/A
+
+h3. *TO-BE*
+ * {color:#de350b}Alpha remains ON whenever Beta is ON{color}
+ ** {color:#de350b}Attempting Alpha ON -> OFF while Beta is ON keeps Alpha ON and shows a warning popup{color}
+ *** {color:#de350b}STATE_FLAG = 0x5: gated off for Beta{color}
+ *** {color:#de350b}popup duration: 1 second{color}
+ * {color:#de350b}Alpha returns to previous value when Beta turns OFF{color}
+ ** Alpha pre-Beta value: OFF
+ *** Beta ON -> Alpha ON
+ *** Beta OFF -> Alpha OFF
+ ** Alpha pre-Beta value: ON
+ *** Beta ON -> Alpha ON
+ *** Beta OFF -> Alpha ON
+
+
+
+※ Signal processing
+|Beta ON
+(OR)| * {color:#de350b}module A normal check {color}{color:#172b4d}& (flag_main = 0x1 (On) \|\| flag_alt = 0x1 (On)){color}
+ * {color:#de350b}module A abnormal check & (flag_alt = 0x1 (On)){color}|
+|Beta OFF
+(OR)| * {color:#de350b}module A normal check{color}{color:#172b4d} & (flag_main = 0x0 (Off) && flag_alt = 0x0 (Off)){color}
+ * {color:#de350b}module A abnormal check & (flag_alt = 0x0 (Off)){color}|
+|Alpha ON|FLAG_ALPHA = 0x2 (On)|
+|Alpha OFF|FLAG_ALPHA = 0x1 (Off)|
+
+(flag_alt is an internal interface signal named IDC.u8AltFlag)
+
+h3. *Source*
+ * Internal requirement
+ ** [EXAMPLE-100 [draft] extended mode spec|https://example.com/browse/EXAMPLE-100]
+ ** [EXAMPLE-101 [draft] state redefinition notes|https://example.com/browse/EXAMPLE-101]
+ ** [^session_notes.msg]
+
+h3. *Plan*
+ * Master Event: release v1 ([release_v1|https://example.com/pages/release-v1])
+ * Application Event: version-specific
+
+h3. *Impact*
+ * Positive effect: user requirement met
+ * Negative effect: N/A

@@ -5,6 +5,109 @@ All notable changes to **cfxmark** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-04-08
+
+### Added
+- **`cfxmark.from_jira_wiki()`** — Jira wiki markup → Markdown parser
+  (experimental, lossy). Round-trips real Jira issue descriptions to
+  canonical Markdown and reaches a fixed point after at most two
+  `wiki → md → wiki` iterations. Supported constructs: `h1.`–`h6.`
+  headings, bullet / ordered / dash lists with nested marker chains
+  (`*`, `**`, `*#`, …), tables with multi-line cells and escaped
+  pipes, paired macros (`{code}`, `{noformat}`, `{quote}`, `{info}`,
+  `{note}`, `{warning}`, `{tip}`, `{panel}`), `bq.` blockquote,
+  `----` horizontal rule, `*bold*`, `_italic_`, `-strike-`,
+  `{{mono}}`, labelled and bare URL links, `[^file]` attachment
+  links (image extensions map to `Image`, everything else maps to
+  `Link` with an `attachment:` URL), `!file.ext!` images, and
+  `{color:#hex}…{color}` inline color (content kept, emphasis
+  dropped with a warning). Boundary-aware emphasis parsing handles
+  real-world Korean text like `8월~9월`, `~9월`, and `2~3` as plain
+  text per Jira's actual rendering rules.
+- **`cfxmark.jira`** submodule as the stable import site for the
+  Jira-flavoured converters: `from cfxmark.jira import from_jira_wiki,
+  to_jira_wiki`. Keeps the experimental/lossy Jira contract
+  visually separated from the lossless Confluence round-trip.
+- **`ConversionOptions.passthrough_html_comment_prefixes`** (R1) —
+  opt-in list of prefixes identifying caller-owned HTML comment
+  blocks like `<!-- workflow:meta … -->`. Matching comments are
+  captured as `PassthroughComment` AST nodes during `parse_md`,
+  emitted verbatim by `render_md`, and silently dropped by
+  `to_cfx` / `to_jira_wiki` so local metadata never leaks to
+  Confluence or Jira. `cfxmark:` prefixes are filtered out so
+  cfxmark's own sentinel comments cannot be hijacked.
+- **`cfxmark.strip_passthrough_comments(source, prefixes)`** — helper
+  for the wrapper's canonical-compare workflow. Removes matching
+  passthrough comment blocks (including their owned trailing blank
+  line) so two Markdown documents can be diffed modulo local
+  metadata.
+- **`to_jira_wiki(heading_promotion=...)`** — new keyword that
+  selects between `"confluence"` (default, the historical H3 → `h2`
+  collapse for pages whose title occupies the top slot), `"jira"`
+  (1:1 identity mapping for Jira issue descriptions, whose titles
+  live in a separate field), and `"none"` (alias for `"jira"`).
+- **`to_cfx(options=...)`** — now accepts `ConversionOptions` so the
+  `passthrough_html_comment_prefixes` opt-in can be plumbed through
+  the Markdown → Confluence direction as well.
+- **`ConfluenceClient.push_markdown(options=...)`** and
+  **`ConfluenceClient.pull_markdown(options=...)`** — the high-level
+  Confluence push / pull helpers now accept `ConversionOptions`. This
+  is the only way a wrapper can actually *use* the R1 passthrough
+  feature end-to-end; without it, the `push_markdown` entry point
+  silently ignored any caller-owned metadata comment policy. On
+  `pull_markdown` the options mainly toggle the Markdown bullet
+  marker and code fence style (`passthrough_html_comment_prefixes`
+  is a no-op on that direction because Confluence storage XHTML has
+  no HTML comment syntax for cfxmark to preserve).
+- **`PassthroughComment`** AST node in `cfxmark.ast` (Markdown-side
+  only; never serialised to CFX or Jira wiki output).
+- 6 Jira wiki fixtures in `tests/fixtures/jira_wiki/` covering the
+  parser's full feature surface (basic prose, sectioned content with
+  boundary-aware tildes, nested lists with dash / asterisk markers,
+  multi-line table cells with escaped pipes, tables immediately
+  adjacent to headings, inline images with italic + empty heading).
+- 81 new unit tests in `tests/unit/test_jira_wiki_parser.py` pinning
+  every supported construct, every fixture's fixed-point
+  convergence, and every known adversarial case (nested link
+  labels, multi-line cells, heading directly after a table,
+  boundary-aware emphasis with non-ASCII and version-range text).
+
+### Changed
+- **`jira_wiki` renderer now escapes `~`, `+`, `^`, and `]`** in
+  addition to the previous set. `~` / `+` / `^` are escaped so that
+  plain text with version ranges (`v1.0~v2.0`), ASCII-art (`x^2`),
+  or non-ASCII runs does not round-trip into an accidental subscript
+  / underline / superscript when re-parsed by a boundary-aware Jira
+  wiki reader. `]` is escaped so that a Markdown link label whose
+  text contains a literal `]` (e.g. `[prefix [nested] rest](url)`)
+  survives the Jira link recogniser's bracket balancing — without
+  this the trailing `]` would prematurely close the emitted Jira
+  link and break the round-trip. Nested-bracket labels now converge
+  in two passes instead of three as a direct consequence.
+
+### Fixed
+- `parsers/md.py` now handles CommonMark HTML comment blocks via a
+  dedicated pre-processing pass instead of relying on mistletoe,
+  which does not emit `HtmlBlock` tokens for multi-line HTML
+  comments. Previously a multi-line `<!-- … -->` ended up in the
+  inline HTML fallback path and was dropped with a warning even
+  when the caller had opted into `passthrough_html_comment_prefixes`.
+- `parsers/jira_wiki.py` now recognises a bare list marker (``-``,
+  ``*``, ``#`` with no trailing content) as an empty list item.
+  Previously the parser treated a single ``-`` at line start as
+  plain text, which diverged from mistletoe's CommonMark
+  interpretation on the Markdown side and caused a document whose
+  last line is a bare ``-`` placeholder (a common "TODO" marker in
+  real issue bodies) to oscillate between ``-`` (mistletoe empty
+  list) and ``\\*`` (escaped plain text) on every round trip.
+  Aligning the two parsers closes the oscillation and keeps the
+  "at most two passes" convergence guarantee for the whole corpus.
+
+### Docs
+- New "Jira wiki (experimental, lossy)" section in `README.md` with
+  the full contract, lossy mapping table, heading-promotion guide,
+  and HTML comment passthrough usage example.
+
 ## [0.2.0] — 2026-05
 
 ### Breaking

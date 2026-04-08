@@ -29,6 +29,7 @@ from cfxmark.ast import (
     ListType,
     OpaqueBlock,
     Paragraph,
+    PassthroughComment,
     SoftBreak,
     Strikethrough,
     Strong,
@@ -213,6 +214,13 @@ def _render_block(
         return _render_directive(block, ctx)
     if isinstance(block, OpaqueBlock):
         return _render_opaque(block)
+    if isinstance(block, PassthroughComment):
+        # Caller-owned HTML comment on the Markdown side — never
+        # serialized to Confluence storage format. The caller owns
+        # this block and synchronizes it out-of-band; emitting it
+        # here would send local metadata to Confluence, which is
+        # exactly what the R1 contract forbids.
+        return None
     raise ConversionError(f"unexpected block node: {type(block).__name__}")
 
 

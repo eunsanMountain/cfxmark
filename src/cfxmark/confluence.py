@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 from urllib.parse import urlparse
 
-from cfxmark.api import to_cfx, to_md
+from cfxmark.api import ConversionOptions, to_cfx, to_md
 from cfxmark.assets import AssetFetcher, _validate_filename, resolve_assets
 from cfxmark.exceptions import CfxmarkError
 from cfxmark.normalize import canonicalize_cfx
@@ -453,6 +453,7 @@ class ConfluenceClient:
         on_conflict: Literal["abort", "retry", "force"] = "abort",
         version_message: str = "Updated via cfxmark",
         strict_filenames: bool = True,
+        options: ConversionOptions | None = None,
     ) -> PushResult:
         """Push a Markdown document to a Confluence page.
 
@@ -481,6 +482,13 @@ class ConfluenceClient:
             path-traversal ruleset that ``resolve_assets`` uses on the
             pull side. Pass ``False`` only if you trust the markdown
             input completely (e.g. machine-generated content).
+        :param options: :class:`cfxmark.ConversionOptions` forwarded to
+            ``to_cfx``. The most important field here is
+            ``passthrough_html_comment_prefixes`` — it lets a wrapper
+            keep caller-owned metadata comments like
+            ``<!-- workflow:meta ... -->`` on the Markdown side while
+            guaranteeing they are dropped before the body reaches
+            Confluence. Added in v0.3.
         :param on_conflict:
             ``"abort"`` (default) — raise ``ConfluenceVersionConflict``
                 on HTTP 409.
@@ -491,7 +499,7 @@ class ConfluenceClient:
                 unconditionally.
         """
         # 1. Render local (cheap, no I/O — fail fast on bad input)
-        cfx_result = to_cfx(md_text)
+        cfx_result = to_cfx(md_text, options=options)
 
         # 2. Validate attachment paths BEFORE any HTTP traffic. The
         #    markdown source may have been authored by an attacker
@@ -600,6 +608,7 @@ class ConfluenceClient:
         md_path: str | Path | None = None,
         resolve_assets_mode: Literal["sidecar", "inline", "none"] = "none",
         asset_dir: str | Path | None = None,
+        options: ConversionOptions | None = None,
     ) -> PullResult:
         """Pull a Confluence page and convert to Markdown.
 
@@ -610,10 +619,17 @@ class ConfluenceClient:
         3. If ``resolve_assets_mode != "none"``: call
            ``cfxmark.resolve_assets`` with ``self.attachment_fetcher``.
         4. Return a ``PullResult``.
+
+        :param options: :class:`cfxmark.ConversionOptions` forwarded to
+            ``to_md``. Useful for choosing the Markdown bullet marker
+            (``-`` / ``*`` / ``+``) or code fence style. The
+            ``passthrough_html_comment_prefixes`` field is a no-op on
+            this direction — Confluence storage XHTML has no HTML
+            comment syntax for cfxmark to preserve. Added in v0.3.
         """
         remote = self.get_page(page_id)
         xhtml = remote["body"]["storage"]["value"]
-        md_result = to_md(xhtml)
+        md_result = to_md(xhtml, options=options)
         markdown = md_result.markdown or ""
         resolved_count = 0
 

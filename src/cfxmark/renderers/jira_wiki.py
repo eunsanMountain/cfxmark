@@ -25,6 +25,7 @@ from cfxmark.ast import (
     ListType,
     OpaqueBlock,
     Paragraph,
+    PassthroughComment,
     SoftBreak,
     Strikethrough,
     Strong,
@@ -39,7 +40,22 @@ _NATIVE_ADMONITIONS = {"info", "note", "warning", "tip"}
 # Single-pass escape: every match is replaced independently, so the
 # backslash-first ordering issue from a sequential .replace() chain
 # disappears.
-_ESCAPE_RE = re.compile(r"[\\*_{[|]")
+#
+# ``~`` / ``+`` / ``^`` are added in v0.3 so that plain-text containing
+# these characters ("v1.0~v2.0", "2~3", "C++", "x^2") does not round
+# trip into an accidental subscript / underline / superscript when the
+# output is pinged back through a boundary-aware Jira wiki parser.
+# Without these escapes the renderer would be lossy on real-world
+# version-range and arithmetic notation.
+#
+# ``]`` is added in v0.3 so that a Markdown link label whose text
+# contains a literal ``]`` (e.g. ``[EXAMPLE-100 [draft] spec|url]``)
+# round-trips without the trailing ``]`` prematurely closing the Jira
+# link on the next parse. Escaping ``[`` alone is insufficient — the
+# Jira link recogniser balances brackets, and an escaped opener
+# followed by an unescaped closer leaves the count unbalanced. This
+# takes nested-bracket labels from three-pass to two-pass convergence.
+_ESCAPE_RE = re.compile(r"[\\*_{[\]|~+^]")
 
 # Constants for `JiraWikiContext.dropped_counts` keys — typo-as-key
 # silently bypasses `_DROPPED_LABELS` lookups, so go through the
@@ -58,16 +74,39 @@ _DROPPED_LABELS: dict[str, str] = {
     _DROP_INLINE_OPAQUE: "<inline opaque>",
 }
 
-# Markdown headings collapse one level (H3→h2, H4→h3, …) so a section
-# subheading authored as H3 surfaces as the top-level Jira section
-# after the page-title H2 is stripped. H1 and H2 stay as h1/h2.
-_HEADING_PROMOTION: dict[int, int] = {1: 1, 2: 2, 3: 2, 4: 3, 5: 4, 6: 5}
+# Two heading mapping tables, selected by :class:`JiraWikiContext`.
+#
+# ``confluence`` (the historical default): Markdown headings collapse
+# one level starting at H3 (H3→h2, H4→h3, …) so a section subheading
+# authored as H3 surfaces as the top-level Jira section after the
+# page-title H2 is stripped on push to a Confluence-style page.
+#
+# ``jira``: a 1:1 mapping — Jira issue descriptions have their own
+# title field, so H1 stays H1 and H3 stays H3. This is the correct
+# choice when a wrapper is pushing to a Jira issue's ``description``
+# instead of a Confluence page body. Added in v0.3.
+#
+# ``none``: alias for ``jira`` (identity). Exposed so callers that do
+# their own heading math upstream can be explicit about opting out.
+_HEADING_PROMOTION_CONFLUENCE: dict[int, int] = {
+    1: 1, 2: 2, 3: 2, 4: 3, 5: 4, 6: 5,
+}
+_HEADING_PROMOTION_JIRA: dict[int, int] = {1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6}
+_HEADING_PROMOTION_TABLES: dict[str, dict[int, int]] = {
+    "confluence": _HEADING_PROMOTION_CONFLUENCE,
+    "jira": _HEADING_PROMOTION_JIRA,
+    "none": _HEADING_PROMOTION_JIRA,
+}
+# Kept for backward compatibility with any external caller that
+# imported the old constant directly.
+_HEADING_PROMOTION = _HEADING_PROMOTION_CONFLUENCE
 
 
 @dataclass
 class JiraWikiContext:
     warnings: list[str] = field(default_factory=list)
     dropped_counts: Counter[str] = field(default_factory=Counter)
+    heading_promotion: str = "confluence"
 
 
 def _escape_wiki(content: str) -> str:
@@ -158,11 +197,14 @@ def _render_list(node: List, ctx: JiraWikiContext, marker_prefix: str = "") -> s
 
 def _render_block(node: BlockNode, ctx: JiraWikiContext) -> str:
     if isinstance(node, Heading):
-        # H3 collapses into h2 (and H4→h3, …) so a "Story Summary"
-        # subsection (typically authored as H3 under an H2 page title)
-        # surfaces as a top-level Jira section after the renderer
-        # strips the page-title H2.
-        promoted = _HEADING_PROMOTION[node.level]
+        # Heading mapping depends on ``ctx.heading_promotion``:
+        # ``confluence`` (default) collapses H3→h2 for page-title
+        # stripping; ``jira``/``none`` use the identity mapping so
+        # that a Jira issue description preserves author intent.
+        table = _HEADING_PROMOTION_TABLES.get(
+            ctx.heading_promotion, _HEADING_PROMOTION_CONFLUENCE
+        )
+        promoted = table[node.level]
         return f"h{promoted}. {_render_inline(node.children, ctx)}"
     if isinstance(node, Paragraph):
         return _render_inline(node.children, ctx)
@@ -194,6 +236,14 @@ def _render_block(node: BlockNode, ctx: JiraWikiContext) -> str:
         return body_text
     if isinstance(node, OpaqueBlock):
         ctx.dropped_counts[_DROP_OPAQUE_BLOCK] += 1
+        return ""
+    if isinstance(node, PassthroughComment):
+        # Caller-owned HTML comment on the Markdown side — never
+        # serialized to Jira wiki markup. The caller owns this block
+        # and synchronizes it out-of-band; emitting it here would
+        # send local metadata to Jira, which is exactly what the R1
+        # contract forbids. No warning is recorded because this is
+        # expected, contract-level behaviour (not a lossy drop).
         return ""
     return ""  # unreachable for well-formed AST
 
@@ -247,6 +297,7 @@ def render_jira_wiki(
     *,
     section: str | None = None,
     drop_leading_notice: tuple[re.Pattern[str], ...] = (),
+    heading_promotion: str = "confluence",
 ) -> tuple[str | None, list[str]]:
     """Render *document* to Jira wiki markup.
 
@@ -256,10 +307,26 @@ def render_jira_wiki(
     :param drop_leading_notice: If the first block of the target
         document is a paragraph whose flattened text matches any pattern
         in this tuple, that paragraph is silently removed.
+    :param heading_promotion: Heading level mapping policy. One of:
+
+        * ``"confluence"`` *(default)* — historical Confluence-style
+          promotion: H3 collapses to ``h2``, H4 to ``h3``, etc. Use
+          when pushing to a Confluence page where the page title
+          already occupies the top ``h1``/``h2`` slot.
+        * ``"jira"`` — 1:1 identity mapping (H1→``h1``, H3→``h3``,
+          …). Use when pushing to a Jira issue ``description`` where
+          the issue title lives in a separate field.
+        * ``"none"`` — alias for ``"jira"``.
+
     :returns: ``(body, warnings)`` where ``body`` is the rendered Jira
         wiki string (or ``None`` when *section* was not found).
     """
-    ctx = JiraWikiContext()
+    if heading_promotion not in _HEADING_PROMOTION_TABLES:
+        raise ValueError(
+            f"heading_promotion must be one of "
+            f"{sorted(_HEADING_PROMOTION_TABLES)}, got {heading_promotion!r}"
+        )
+    ctx = JiraWikiContext(heading_promotion=heading_promotion)
     if section is not None:
         target = _slice_section(document, section)
         if target is None:

@@ -49,6 +49,7 @@ from cfxmark.ast import (
     ListType,
     OpaqueBlock,
     Paragraph,
+    PassthroughComment,
     SoftBreak,
     Strikethrough,
     Strong,
@@ -85,6 +86,7 @@ if _HtmlSpanToken is not None and _HtmlSpanToken not in span_token._token_types:
 
 _OPAQUE_MARKER = "CFXMARK_OPAQUE"
 _DIRECTIVE_MARKER = "CFXMARK_DIRECTIVE"
+_PASSTHROUGH_MARKER = "CFXMARK_PASSTHROUGH"
 
 
 def _placeholder(kind: str, index: int) -> str:
@@ -93,7 +95,9 @@ def _placeholder(kind: str, index: int) -> str:
     return f"`{kind}-{index}-CFXMARK`"
 
 
-_PLACEHOLDER_RE = re.compile(r"^(CFXMARK_OPAQUE|CFXMARK_DIRECTIVE)-(\d+)-CFXMARK$")
+_PLACEHOLDER_RE = re.compile(
+    r"^(CFXMARK_OPAQUE|CFXMARK_DIRECTIVE|CFXMARK_PASSTHROUGH)-(\d+)-CFXMARK$"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +123,7 @@ class _PreprocessResult:
     source: str
     opaques: list[_OpaqueCapture] = field(default_factory=list)
     directives: list[_DirectiveCapture] = field(default_factory=list)
+    passthroughs: list[str] = field(default_factory=list)
     inline_payloads: dict[str, str] = field(default_factory=dict)
     asset_src_map: dict[str, str] = field(default_factory=dict)
 
@@ -149,7 +154,10 @@ def _parse_directive_params(rest: str) -> tuple[tuple[str, str], ...]:
     return tuple(params)
 
 
-def _preprocess(source: str) -> _PreprocessResult:
+def _preprocess(
+    source: str,
+    passthrough_html_comment_prefixes: tuple[str, ...] = (),
+) -> _PreprocessResult:
     """Strip opaque blocks and directive fences, substituting placeholders."""
 
     # 1. Strip the cfxmark header notice if present.
@@ -189,6 +197,12 @@ def _preprocess(source: str) -> _PreprocessResult:
     opaque_parts.append(source[cursor:])
     after_opaque = "".join(opaque_parts)
 
+    # --- Passthrough comment open detector. Built once per call so
+    # the line scanner can fast-path when no prefix was registered.
+    passthrough_open_re = _build_passthrough_open_re(
+        passthrough_html_comment_prefixes
+    )
+
     # --- Directive fences: scan line by line, balanced with a simple
     # depth counter. Nested directives are not supported in v0.1.
     # Lines inside a CommonMark fenced code block are passed through
@@ -218,6 +232,42 @@ def _preprocess(source: str) -> _PreprocessResult:
             out_lines.append(line)
             i += 1
             continue
+
+        # Caller-owned HTML comment passthrough (R1). The line must
+        # *start* with ``<!--<prefix>`` (after optional whitespace);
+        # then we collect lines until one contains ``-->``. This
+        # handles both single-line and multi-line comments because
+        # mistletoe does not recognize HTML comment blocks at all in
+        # the dialects we use, so we must intercept here before
+        # mistletoe sees the source.
+        if passthrough_open_re is not None:
+            open_pt = passthrough_open_re.match(line)
+            if open_pt is not None:
+                start_line = i
+                # Collect lines until we find ``-->``. Greedy across
+                # lines but stops at the first ``-->`` per CommonMark
+                # HTML comment semantics.
+                while i < n and "-->" not in lines[i]:
+                    i += 1
+                if i < n:
+                    end_line = i
+                    i += 1  # Consume the closing line.
+                    captured = "\n".join(lines[start_line : end_line + 1])
+                    # Strip a trailing run of whitespace after ``-->``
+                    # so the captured text ends right at the sentinel.
+                    arrow_pos = captured.rfind("-->")
+                    captured = captured[: arrow_pos + 3]
+                    idx = len(result.passthroughs)
+                    result.passthroughs.append(captured)
+                    out_lines.append("")
+                    out_lines.append(
+                        _placeholder(_PASSTHROUGH_MARKER, idx)
+                    )
+                    out_lines.append("")
+                    continue
+                # Unterminated comment — fall through and let
+                # mistletoe deal with it as raw text. The wrapper
+                # should not feed unterminated comments anyway.
 
         open_match = _DIRECTIVE_OPEN_RE.match(line.strip())
         if open_match is None:
@@ -252,6 +302,24 @@ def _preprocess(source: str) -> _PreprocessResult:
     return result
 
 
+def _build_passthrough_open_re(
+    prefixes: tuple[str, ...],
+) -> re.Pattern[str] | None:
+    """Build a regex matching the *opening line* of an HTML comment
+    whose first non-whitespace token starts with one of ``prefixes``.
+
+    Returns ``None`` when no eligible prefix is configured. ``cfxmark:``
+    prefixes are filtered out so cfxmark's own sentinel comments
+    cannot be hijacked into a passthrough capture.
+    """
+
+    safe = tuple(p for p in prefixes if not p.startswith("cfxmark:"))
+    if not safe:
+        return None
+    alternation = "|".join(re.escape(p) for p in safe)
+    return re.compile(r"^[ \t]*<!--\s*(?:" + alternation + r")")
+
+
 # ---------------------------------------------------------------------------
 # mistletoe walker
 # ---------------------------------------------------------------------------
@@ -262,10 +330,12 @@ class _MdConverter:
         self,
         pre: _PreprocessResult,
         registry: MacroRegistry,
+        passthrough_html_comment_prefixes: tuple[str, ...] = (),
     ) -> None:
         self.pre = pre
         self.registry = registry
         self.warnings: list[str] = []
+        self.passthrough_html_comment_prefixes = passthrough_html_comment_prefixes
 
     # ---- block-level ------------------------------------------------------
 
@@ -332,7 +402,13 @@ class _MdConverter:
         md_doc = MdDocument(source)
         # Hand the inner walker the *outer* preprocess state so
         # placeholder lookups continue to work.
-        inner = _MdConverter(pre=self.pre, registry=self.registry)
+        inner = _MdConverter(
+            pre=self.pre,
+            registry=self.registry,
+            passthrough_html_comment_prefixes=(
+                self.passthrough_html_comment_prefixes
+            ),
+        )
         document = inner.convert_document(md_doc)
         self.warnings.extend(inner.warnings)
         return document.children
@@ -341,7 +417,8 @@ class _MdConverter:
         inline = self._convert_inline_children(tok)
         # Placeholder substitution: a paragraph whose inline content is
         # exactly one inline-code span matching a placeholder marker
-        # is replaced with the stored opaque / directive content.
+        # is replaced with the stored opaque / directive / passthrough
+        # content.
         if len(inline) == 1 and isinstance(inline[0], InlineCode):
             m = _PLACEHOLDER_RE.match(inline[0].content.strip())
             if m:
@@ -365,6 +442,14 @@ class _MdConverter:
                             name=dir_cap.name,
                             parameters=dir_cap.parameters,
                             body=body_blocks if body_blocks else None,
+                        )
+                    ]
+                if kind == _PASSTHROUGH_MARKER and 0 <= idx < len(
+                    self.pre.passthroughs
+                ):
+                    return [
+                        PassthroughComment(
+                            content=self.pre.passthroughs[idx]
                         )
                     ]
         return [Paragraph(children=inline)]
@@ -789,19 +874,33 @@ def parse_md(
     source: str,
     *,
     registry: MacroRegistry | None = None,
+    passthrough_html_comment_prefixes: tuple[str, ...] = (),
 ) -> tuple[Document, list[str]]:
     """Parse a Markdown string into a cfxmark AST.
 
     :param source: CommonMark + GFM tables + strikethrough + cfxmark
         extensions (opaque sentinels, directive fences).
     :param registry: macro registry, defaults to :data:`cfxmark.macros.default_registry`.
+    :param passthrough_html_comment_prefixes: tuple of leading-word
+        prefixes (``"workflow:"``, …) that identify HTML comment
+        blocks caller-owned on the Markdown side. Matching comments
+        are preserved across round-trip as
+        :class:`cfxmark.ast.PassthroughComment` nodes instead of being
+        dropped with a warning.
     :returns: ``(document, warnings)`` tuple.
     """
 
-    pre = _preprocess(source)
+    pre = _preprocess(
+        source,
+        passthrough_html_comment_prefixes=passthrough_html_comment_prefixes,
+    )
     try:
         md_doc = MdDocument(pre.source)
-        converter = _MdConverter(pre=pre, registry=registry or default_registry)
+        converter = _MdConverter(
+            pre=pre,
+            registry=registry or default_registry,
+            passthrough_html_comment_prefixes=passthrough_html_comment_prefixes,
+        )
         document = converter.convert_document(md_doc)
     except Exception as ex:  # pragma: no cover — defensive
         raise ParseError(f"failed to parse markdown: {ex}") from ex
