@@ -34,6 +34,132 @@ def test_emphasis() -> None:
     assert md("<p><em>italic</em></p>") == "*italic*"
 
 
+# ---------------------------------------------------------------------------
+# CJK boundary fallback regression
+#
+# CommonMark's flanking-delimiter rule blocks ``**X**`` from being re-parsed
+# as bold when both outer characters are "word" characters. CJK glyphs are
+# all alphanumeric under Python's ``str.isalnum``, so every Korean / Chinese
+# / Japanese character triggers the rule. ``to_md`` must emit raw
+# ``<strong>`` HTML in those positions so the round trip survives — otherwise
+# the asterisks would stay literal on re-parse and the user would see
+# ``**볼드**`` on Confluence instead of **볼드**.
+#
+# These tests pin the behavior so refactors cannot silently flip the policy.
+# ---------------------------------------------------------------------------
+
+
+def test_strong_korean_word_flank_falls_back_to_html() -> None:
+    # Both sides are Korean word characters → must use raw <strong>.
+    assert (
+        md("<p>한국어<strong>볼드</strong>입니다</p>")
+        == "한국어<strong>볼드</strong>입니다"
+    )
+
+
+def test_strong_cjk_ideograph_flank_falls_back_to_html() -> None:
+    # Chinese ideographs are also alphanumeric → same fallback applies.
+    assert (
+        md("<p>汉字<strong>粗体</strong>文本</p>")
+        == "汉字<strong>粗体</strong>文本"
+    )
+
+
+def test_strong_with_spaces_around_korean_uses_plain_markdown() -> None:
+    # Spaces on both sides break the word-char flank → plain ``**`` is safe.
+    assert (
+        md("<p>한국어 <strong>bold</strong> 한국어</p>")
+        == "한국어 **bold** 한국어"
+    )
+
+
+def test_emphasis_korean_word_flank_falls_back_to_html() -> None:
+    assert (
+        md("<p>한국어<em>강조</em>입니다</p>")
+        == "한국어<em>강조</em>입니다"
+    )
+
+
+def test_emphasis_pure_korean_no_flank_uses_plain_markdown() -> None:
+    # Paragraph-only emphasis has empty outer chars → plain ``*`` works.
+    assert md("<p><em>강조</em></p>") == "*강조*"
+
+
+def test_strikethrough_korean_word_flank_falls_back_to_html() -> None:
+    assert (
+        md("<p>한국어<del>취소</del>입니다</p>")
+        == "한국어<del>취소</del>입니다"
+    )
+
+
+def test_strong_cjk_boundary_inside_list_item() -> None:
+    # Same policy must apply inside block containers (lists, headings …).
+    assert (
+        md("<ul><li>항목<strong>볼드</strong>끝</li></ul>")
+        == "- 항목<strong>볼드</strong>끝"
+    )
+
+
+def test_strong_cjk_boundary_inside_heading() -> None:
+    assert (
+        md("<h2>제목<strong>강조</strong></h2>")
+        == "## 제목<strong>강조</strong>"
+    )
+
+
+def test_strong_cjk_boundary_mixed_ascii_and_korean_flank() -> None:
+    # Flank detection only looks at the adjacent character; mixed ASCII and
+    # Korean on either side still counts as word-flank and triggers fallback.
+    assert (
+        md("<p>prefix한국어<strong>볼드</strong>suffix한국어</p>")
+        == "prefix한국어<strong>볼드</strong>suffix한국어"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Renderer determinism guardrails
+#
+# The renderer is a pure function over the AST, so calling ``to_md`` multiple
+# times on the same input MUST produce identical output. If these tests ever
+# fail, the renderer has acquired an internal cache, random seed, or other
+# context-dependent branch — investigate immediately.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "xhtml",
+    [
+        "<p>한국어<strong>볼드</strong>입니다</p>",
+        "<p>汉字<strong>粗体</strong>文本</p>",
+        "<p>한국어 <strong>bold</strong> 한국어</p>",
+        "<h2>제목<strong>강조</strong></h2>",
+        "<ul><li>항목<strong>볼드</strong>끝</li></ul>",
+    ],
+)
+def test_to_md_is_deterministic_across_calls(xhtml: str) -> None:
+    outputs = {cfxmark.to_md(xhtml).markdown for _ in range(5)}
+    assert len(outputs) == 1, f"non-deterministic output: {outputs}"
+
+
+@pytest.mark.parametrize(
+    "xhtml",
+    [
+        "<p>한국어<strong>볼드</strong>입니다</p>",
+        "<p>汉字<strong>粗体</strong>文本</p>",
+        "<p>한국어 <strong>bold</strong> 한국어</p>",
+        "<h2>제목<strong>강조</strong></h2>",
+        "<ul><li>항목<strong>볼드</strong>끝</li></ul>",
+    ],
+)
+def test_cjk_boundary_round_trip_converges_in_one_pass(xhtml: str) -> None:
+    # The core invariant: once you've passed through to_md→to_cfx once, a
+    # second pass must be a fixed point. The CJK boundary branch of this
+    # invariant was not covered by the v0.1.0 ASCII-only property test.
+    once = cfxmark.to_md(cfxmark.to_cfx(cfxmark.to_md(xhtml).markdown).xhtml).markdown
+    twice = cfxmark.to_md(cfxmark.to_cfx(once).xhtml).markdown
+    assert once == twice
+
+
 def test_inline_code() -> None:
     assert md("<p><code>x</code></p>") == "`x`"
 

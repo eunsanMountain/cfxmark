@@ -5,6 +5,41 @@ All notable changes to **cfxmark** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] — 2026-04-08
+
+### Tests
+
+- Added explicit CJK boundary regression tests covering the Strong /
+  Emphasis / Strikethrough HTML fallback path. When a delimiter run is
+  flanked by word characters on both sides (for example Korean glyphs
+  adjacent to `**bold**`), CommonMark's flanking-delimiter rule
+  prevents the asterisks from re-parsing as emphasis, so cfxmark emits
+  raw `<strong>...</strong>` / `<em>...</em>` / `<del>...</del>` HTML
+  to preserve the round trip. The policy was already correct in the
+  renderer — these tests pin the behavior so future refactors cannot
+  silently flip it.
+- Added renderer determinism guardrails: repeated `to_md` calls on the
+  same input, and the `to_md → to_cfx → to_md` convergence invariant,
+  are now asserted explicitly for CJK-heavy inputs.
+- Extended the Hypothesis property test (`test_round_trip.py`) with a
+  CJK-inclusive corpus (Hangul Syllables + CJK Unified Ideographs)
+  and inline emphasis runs (`**bold**`, `*italic*`, `~~strike~~`).
+  The original v0.1.0 strategy was ASCII-only and never exercised the
+  CJK word-boundary branch of the renderer. The new strategy produces
+  100 randomized documents per run and still converges in a single
+  pipeline pass.
+
+### Docs
+
+- `README.md` now documents `cfxmark.normalize_md(source)` as the
+  pre-push canonicalization recipe. The function was already exported
+  from `cfxmark` in v0.1.0 but was not discoverable from the README.
+  Applying it to hand-edited Markdown before calling `to_cfx` converges
+  any drift to the parse→render fixpoint and avoids the "local file
+  drifted from the round-trip form" failure mode.
+- The canonicalization section now presents `canonicalize_cfx` and
+  `normalize_md` as a matched pair with worked examples.
+
 ## [0.1.3] — 2026-04-07
 
 ### Changed

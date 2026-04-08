@@ -256,6 +256,11 @@ planned for v0.2.
 
 ### Canonicalization helpers
 
+cfxmark ships two canonicalization helpers, one for each side of the
+pipeline. Both are idempotent: `f(f(x)) == f(x)`.
+
+#### `canonicalize_cfx(xhtml)` — compare two storage fragments
+
 Two Confluence storage fragments are "the same" only after a deep
 normalization pass that strips volatile attributes, editor noise,
 and rendering hints. Use `canonicalize_cfx` to compare two snapshots:
@@ -270,6 +275,43 @@ assert c1 == c2  # passes for any document in the supported subset
 
 `canonicalize_cfx` is the same function the test suite uses to
 verify byte-identical round trips against real Confluence pages.
+A good push pipeline calls it **before** the REST PUT so an unchanged
+body is skipped entirely:
+
+```python
+remote = cfxmark.canonicalize_cfx(my_client.get_page(page_id))
+local = cfxmark.canonicalize_cfx(cfxmark.to_cfx(local_md).xhtml)
+if remote != local:
+    my_client.update_page(page_id, ...)
+```
+
+#### `normalize_md(markdown)` — converge hand-edited Markdown
+
+`normalize_md` is the Markdown-side counterpart: it runs the document
+through `parse_md → render_md` so the output is exactly the form
+cfxmark would have produced. Applying it before push flattens any
+drift introduced by hand edits, a different editor's Markdown
+autoformatter, or a historical cfxmark version.
+
+```python
+import cfxmark
+
+# Pre-push recipe: normalize hand-edited Markdown so the canonical
+# XHTML body is stable across authors and editor plugins.
+clean_md = cfxmark.normalize_md(local_md_from_disk)
+xhtml = cfxmark.to_cfx(clean_md).xhtml
+```
+
+The key property: a document produced by `to_md` is already a fixed
+point of `normalize_md`, so round-trippers pay nothing. Hand-edited
+documents converge in a single pass, and that pass is enough to
+eliminate the "local file drifted from the round-trip form" class of
+bug (for example, stray ``**`` delimiters in positions where cfxmark
+would have emitted raw `<strong>` HTML because of CommonMark's CJK
+word-boundary rule).
+
+If you only push `normalize_md(text)` rather than raw hand-edits,
+the `canonicalize_cfx` diff above stays stable across collaborators.
 
 ## Security
 
