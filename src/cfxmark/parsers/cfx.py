@@ -32,7 +32,9 @@ from cfxmark.ast import (
     BlockQuote,
     CellAlign,
     CellType,
+    Citation,
     CodeBlock,
+    ColorSpan,
     Document,
     Emphasis,
     HardBreak,
@@ -51,10 +53,13 @@ from cfxmark.ast import (
     SoftBreak,
     Strikethrough,
     Strong,
+    Subscript,
+    Superscript,
     Table,
     TableCell,
     TableRow,
     Text,
+    Underline,
 )
 from cfxmark.exceptions import ParseError
 from cfxmark.macros import MacroRegistry, default_registry
@@ -437,13 +442,19 @@ def _parse_html_inline(
         alt = element.get("alt") or ""
         title = element.get("title")
         return [Image(src=src, alt=alt, title=title)]
-    if tag == "u":
-        # Underline has no dedicated AST node — pass children through as text.
-        return list(_parse_inline(element, ctx))
-    if tag in ("sub", "sup"):
-        # Sub/superscript rare in our corpus; fall through as plain children.
-        return list(_parse_inline(element, ctx))
+    if tag == "u" or tag == "ins":
+        return [Underline(children=_parse_inline(element, ctx))]
+    if tag == "sub":
+        return [Subscript(children=_parse_inline(element, ctx))]
+    if tag == "sup":
+        return [Superscript(children=_parse_inline(element, ctx))]
+    if tag == "cite":
+        return [Citation(children=_parse_inline(element, ctx))]
     if tag == "span":
+        style = element.get("style") or ""
+        color_match = re.search(r"color:\s*([^;\"']+)", style)
+        if color_match:
+            return [ColorSpan(color=color_match.group(1).strip(), children=_parse_inline(element, ctx))]
         # A span we didn't unwrap — treat children as inline, lossy.
         ctx.warnings.append("inline <span> with unknown attributes stripped")
         return list(_parse_inline(element, ctx))

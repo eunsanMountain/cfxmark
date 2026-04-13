@@ -9,7 +9,10 @@ from dataclasses import dataclass, field
 from cfxmark.ast import (
     BlockNode,
     BlockQuote,
+    CellType,
+    Citation,
     CodeBlock,
+    ColorSpan,
     DirectiveMacro,
     Document,
     Emphasis,
@@ -29,8 +32,12 @@ from cfxmark.ast import (
     SoftBreak,
     Strikethrough,
     Strong,
+    Subscript,
+    Superscript,
     Table,
+    TableRow,
     Text,
+    Underline,
 )
 
 _log = logging.getLogger("cfxmark.renderers.jira_wiki")
@@ -55,21 +62,24 @@ _NATIVE_ADMONITIONS = {"info", "note", "warning", "tip"}
 # Jira link recogniser balances brackets, and an escaped opener
 # followed by an unescaped closer leaves the count unbalanced. This
 # takes nested-bracket labels from three-pass to two-pass convergence.
-_ESCAPE_RE = re.compile(r"[\\*_{[\]|~+^]")
+#
+# ``\`` is deliberately NOT escaped. In Jira wiki ``\\`` is always a
+# forced line break (HardBreak), so escaping a literal backslash as
+# ``\\`` would silently inject a line break. A lone ``\`` followed by
+# a non-special character passes through as literal text in Jira's
+# renderer, and ``\`` followed by a special character produces the
+# desired escape. The only lossy case is a backslash immediately
+# before a Jira-special character (e.g. ``\*``), which is already the
+# Jira escape sequence for a literal ``*`` — i.e. the right thing.
+_ESCAPE_RE = re.compile(r"[*_{[\]|~+^]")
 
 # Constants for `JiraWikiContext.dropped_counts` keys — typo-as-key
 # silently bypasses `_DROPPED_LABELS` lookups, so go through the
 # constants instead of bare string literals.
-_DROP_TABLE = "table"
-_DROP_BLOCKQUOTE = "blockquote"
-_DROP_HARD_BREAK = "hard_break"
 _DROP_OPAQUE_BLOCK = "opaque_block"
 _DROP_INLINE_OPAQUE = "inline_opaque"
 
 _DROPPED_LABELS: dict[str, str] = {
-    _DROP_TABLE: "<table>",
-    _DROP_BLOCKQUOTE: "<blockquote>",
-    _DROP_HARD_BREAK: "<br>",
     _DROP_OPAQUE_BLOCK: "<opaque>",
     _DROP_INLINE_OPAQUE: "<inline opaque>",
 }
@@ -104,6 +114,7 @@ class JiraWikiContext:
     warnings: list[str] = field(default_factory=list)
     dropped_counts: Counter[str] = field(default_factory=Counter)
     heading_promotion: str = "confluence"
+    code_language_map: dict[str, str] | None = None
 
 
 def _escape_wiki(content: str) -> str:
@@ -116,7 +127,7 @@ def _inline_text(nodes: tuple[InlineNode, ...]) -> str:
     for n in nodes:
         if isinstance(n, Text):
             parts.append(n.content)
-        elif isinstance(n, (Emphasis, Strong, Strikethrough, Link)):
+        elif isinstance(n, (Emphasis, Strong, Strikethrough, Subscript, Superscript, Underline, ColorSpan, Citation, Link)):
             parts.append(_inline_text(n.children))
         elif isinstance(n, InlineCode):
             parts.append(n.content)
@@ -134,13 +145,24 @@ def _render_inline(nodes: tuple[InlineNode, ...], ctx: JiraWikiContext) -> str:
         elif isinstance(n, SoftBreak):
             buf.append(" ")
         elif isinstance(n, HardBreak):
-            ctx.dropped_counts[_DROP_HARD_BREAK] += 1
+            buf.append("\\\\\n")
         elif isinstance(n, Strong):
             buf.append("*" + _render_inline(n.children, ctx) + "*")
         elif isinstance(n, Emphasis):
             buf.append("_" + _render_inline(n.children, ctx) + "_")
         elif isinstance(n, Strikethrough):
             buf.append("-" + _render_inline(n.children, ctx) + "-")
+        elif isinstance(n, Subscript):
+            buf.append("~" + _render_inline(n.children, ctx) + "~")
+        elif isinstance(n, Superscript):
+            buf.append("^" + _render_inline(n.children, ctx) + "^")
+        elif isinstance(n, Underline):
+            buf.append("+" + _render_inline(n.children, ctx) + "+")
+        elif isinstance(n, ColorSpan):
+            inner = _render_inline(n.children, ctx)
+            buf.append(f"{{color:{n.color}}}{inner}{{color}}")
+        elif isinstance(n, Citation):
+            buf.append("??" + _render_inline(n.children, ctx) + "??")
         elif isinstance(n, InlineCode):
             buf.append("{{" + n.content + "}}")
         elif isinstance(n, Link):
@@ -156,6 +178,54 @@ def _render_inline(nodes: tuple[InlineNode, ...], ctx: JiraWikiContext) -> str:
             buf.append(f"(cfx:{n.label})")
             ctx.dropped_counts[_DROP_INLINE_OPAQUE] += 1
     return "".join(buf)
+
+
+def _render_table_row(row: TableRow, ctx: JiraWikiContext) -> str:
+    """Render a single table row to Jira wiki syntax.
+
+    Table rows must be single-line in Jira wiki. Any ``\\\\\\n``
+    (HardBreak) inside a cell is collapsed to ``\\\\`` so the row
+    does not spill across lines.
+    """
+    parts: list[str] = []
+    for cell in row.cells:
+        if cell.colspan > 1:
+            ctx.warnings.append(
+                f"Table cell colspan={cell.colspan} not supported in Jira wiki"
+                " — only the first cell is emitted"
+            )
+        if cell.rowspan > 1:
+            ctx.warnings.append(
+                f"Table cell rowspan={cell.rowspan} not supported in Jira wiki"
+                " — only the first cell is emitted"
+            )
+        content = _render_inline(cell.children, ctx)
+        # Collapse HardBreak newlines so the row stays on one line.
+        content = content.replace("\\\\\n", "\\\\")
+        # Ensure non-empty content so adjacent delimiters (``||``) are
+        # not mis-parsed as a header-cell opener on re-read.
+        if not content:
+            content = " "
+        if cell.kind == CellType.HEADER:
+            parts.append(f"||{content}")
+        else:
+            parts.append(f"|{content}")
+    # Close the row with the matching delimiter.
+    if row.cells and row.cells[-1].kind == CellType.HEADER:
+        parts.append("||")
+    else:
+        parts.append("|")
+    return "".join(parts)
+
+
+def _render_table(node: Table, ctx: JiraWikiContext) -> str:
+    """Render a Table node to Jira wiki syntax."""
+    lines: list[str] = []
+    if node.header is not None:
+        lines.append(_render_table_row(node.header, ctx))
+    for row in node.body:
+        lines.append(_render_table_row(row, ctx))
+    return "\n".join(lines)
 
 
 def _render_list(node: List, ctx: JiraWikiContext, marker_prefix: str = "") -> str:
@@ -205,7 +275,10 @@ def _render_block(node: BlockNode, ctx: JiraWikiContext) -> str:
     if isinstance(node, Paragraph):
         return _render_inline(node.children, ctx)
     if isinstance(node, CodeBlock):
-        fence_open = f"{{code:{node.language}}}" if node.language else "{code}"
+        lang = node.language
+        if lang and ctx.code_language_map and lang in ctx.code_language_map:
+            lang = ctx.code_language_map[lang]
+        fence_open = f"{{code:{lang}}}" if lang else "{code}"
         content = node.content.rstrip("\n")
         if "{code}" in content:
             ctx.warnings.append(
@@ -214,15 +287,31 @@ def _render_block(node: BlockNode, ctx: JiraWikiContext) -> str:
             )
         return f"{fence_open}\n{content}\n{{code}}"
     if isinstance(node, BlockQuote):
-        ctx.dropped_counts[_DROP_BLOCKQUOTE] += 1
-        return ""
+        inner_blocks = []
+        for child in node.children:
+            if isinstance(child, BlockQuote):
+                # Jira wiki does not support nested {quote} — flatten
+                # the inner quote's children and emit a warning.
+                ctx.warnings.append(
+                    "nested blockquote flattened — Jira wiki does not"
+                    " support {quote} nesting"
+                )
+                for grandchild in child.children:
+                    rendered = _render_block(grandchild, ctx)
+                    if rendered:
+                        inner_blocks.append(rendered)
+            else:
+                rendered = _render_block(child, ctx)
+                if rendered:
+                    inner_blocks.append(rendered)
+        body_text = "\n\n".join(inner_blocks)
+        return f"{{quote}}\n{body_text}\n{{quote}}"
     if isinstance(node, List):
         return _render_list(node, ctx)
     if isinstance(node, HorizontalRule):
         return "----"
     if isinstance(node, Table):
-        ctx.dropped_counts[_DROP_TABLE] += 1
-        return ""
+        return _render_table(node, ctx)
     if isinstance(node, DirectiveMacro):
         body_blocks = node.body or ()
         body_text = "\n\n".join(filter(None, (_render_block(b, ctx) for b in body_blocks)))
@@ -294,6 +383,7 @@ def render_jira_wiki(
     section: str | None = None,
     drop_leading_notice: tuple[re.Pattern[str], ...] = (),
     heading_promotion: str = "confluence",
+    code_language_map: dict[str, str] | None = None,
 ) -> tuple[str | None, list[str]]:
     """Render *document* to Jira wiki markup.
 
@@ -314,6 +404,12 @@ def render_jira_wiki(
           the issue title lives in a separate field.
         * ``"none"`` — alias for ``"jira"``.
 
+    :param code_language_map: Optional mapping of code block language
+        identifiers to their normalized forms (e.g.
+        ``{"ts": "javascript", "kotlin": "java"}``). When a
+        :class:`CodeBlock` node's ``language`` matches a key, the
+        mapped value is emitted instead. ``None`` (default) disables
+        normalization — languages pass through unchanged.
     :returns: ``(body, warnings)`` where ``body`` is the rendered Jira
         wiki string (or ``None`` when *section* was not found).
     """
@@ -322,7 +418,10 @@ def render_jira_wiki(
             f"heading_promotion must be one of "
             f"{sorted(_HEADING_PROMOTION_TABLES)}, got {heading_promotion!r}"
         )
-    ctx = JiraWikiContext(heading_promotion=heading_promotion)
+    ctx = JiraWikiContext(
+        heading_promotion=heading_promotion,
+        code_language_map=code_language_map,
+    )
     if section is not None:
         target = _slice_section(document, section)
         if target is None:

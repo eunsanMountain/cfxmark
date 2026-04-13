@@ -5,6 +5,66 @@ All notable changes to **cfxmark** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-04-13
+
+### Added
+- **Table → Jira wiki rendering** — `to_jira_wiki()` now renders
+  `Table` / `TableRow` / `TableCell` AST nodes as Jira wiki table
+  syntax (`||header||` / `|data|`). `colspan` / `rowspan` emit a
+  warning (Jira wiki does not support them). Empty cells are padded
+  with a space to prevent `||` from being mis-parsed as a header
+  delimiter on re-read.
+- **BlockQuote → `{quote}` rendering** — `to_jira_wiki()` now renders
+  `BlockQuote` nodes as `{quote}…{quote}` blocks. Nested blockquotes
+  are flattened with a warning (Jira wiki does not support `{quote}`
+  nesting).
+- **HardBreak → `\\` rendering** — `to_jira_wiki()` now renders
+  `HardBreak` nodes as `\\` (Jira wiki forced line break). Inside
+  table cells the trailing newline is suppressed so the row stays on
+  one line.
+- **HardBreak parsing** — `from_jira_wiki()` now recognises `\\` as
+  a `HardBreak` AST node instead of treating it as an escaped
+  backslash. An optional newline immediately after `\\` is consumed.
+- **`Subscript`**, **`Superscript`**, **`Underline`** AST nodes and
+  full parser / renderer support. `from_jira_wiki()` now parses
+  `~sub~`, `^sup^`, `+ins+` into dedicated AST nodes (previously
+  the markers were dropped with a warning). The Jira wiki renderer
+  emits the native markers; the Markdown renderer emits `<sub>`,
+  `<sup>`, `<ins>` HTML tags; the Confluence renderer emits matching
+  XHTML elements.
+- **`ColorSpan`** AST node — `from_jira_wiki()` now preserves
+  `{color:#hex}text{color}` as a `ColorSpan(color, children)` node
+  instead of dropping the colour with a warning. The Jira wiki
+  renderer restores `{color:value}…{color}`; the Markdown renderer
+  emits `<span style="color:value">…</span>`.
+- **`Citation`** AST node and `??text??` parsing —
+  `from_jira_wiki()` now recognises `??cited text??` as a `Citation`
+  node. The Jira wiki renderer emits `??…??`; the Markdown renderer
+  emits `<cite>…</cite>`.
+- **`code_language_map`** option on `to_jira_wiki()` and
+  `render_jira_wiki()` — optional `dict[str, str]` that normalises
+  code block language identifiers before rendering (e.g.
+  `{"ts": "javascript", "kotlin": "java"}`). `None` (default)
+  preserves the original language tag unchanged.
+
+### Changed
+- **`_EMPHASIS_NODE` mapping** in the Jira wiki parser now maps `~`,
+  `+`, `^` to `Subscript`, `Underline`, `Superscript` respectively
+  (previously `None`, which caused marker-drop with warning).
+- **`InlineNode` union** expanded with `Subscript`, `Superscript`,
+  `Underline`, `ColorSpan`, `Citation`.
+- Drop-count constants `_DROP_TABLE`, `_DROP_BLOCKQUOTE`,
+  `_DROP_HARD_BREAK` removed from the Jira wiki renderer — these
+  constructs are now rendered instead of dropped.
+
+### Fixed
+- **Table cell empty-content ambiguity** — empty data cells now
+  render as `| |` (with a space) so adjacent delimiters are not
+  mis-parsed as header openers on re-read. Fixes round-trip
+  instability for tables with sparse cells.
+- **HardBreak in table cells** — `\\\n` inside a cell is collapsed
+  to `\\` (no newline) so the table row stays on a single line.
+
 ## [0.3.0] — 2026-04-08
 
 ### Added

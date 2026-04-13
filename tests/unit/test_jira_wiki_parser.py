@@ -27,7 +27,6 @@ from cfxmark.ast import (
     InlineCode,
     Link,
     List,
-    ListItem,
     ListType,
     Paragraph,
     Strikethrough,
@@ -37,7 +36,6 @@ from cfxmark.ast import (
 )
 from cfxmark.jira import from_jira_wiki
 from cfxmark.parsers.jira_wiki import parse_jira_wiki
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -161,19 +159,19 @@ def test_unclosed_tilde_is_plain_text() -> None:
     assert text.startswith("~next week")
 
 
-def test_closed_tilde_drops_markers_with_warning() -> None:
-    """A properly boundary-matched ``~sub~`` has no AST equivalent
-    (cfxmark has no subscript node), so the markers are dropped and a
-    lossy warning is recorded."""
+def test_closed_tilde_produces_subscript_node() -> None:
+    """A properly boundary-matched ``~sub~`` produces a Subscript AST
+    node (added in v0.4)."""
+    from cfxmark.ast import Subscript
+
     document, warnings, _ = parse_full("word ~sub~ here")
     para = document.children[0]
     assert isinstance(para, Paragraph)
-    text = "".join(
-        n.content for n in para.children if isinstance(n, Text)
-    )
-    assert "sub" in text
-    assert "~sub~" not in text
-    assert any("dropped" in w for w in warnings)
+    subs = [n for n in para.children if isinstance(n, Subscript)]
+    assert len(subs) == 1
+    assert subs[0].children == (Text(content="sub"),)
+    # No lossy warning — the node is preserved.
+    assert not any("dropped" in w for w in warnings)
 
 
 def test_bold_inside_word_is_plain_text() -> None:
@@ -219,7 +217,6 @@ def test_emphasis_content_must_not_start_with_whitespace() -> None:
         (r"\{", "{"),
         (r"\[", "["),
         (r"\|", "|"),
-        (r"\\", "\\"),
         (r"\~", "~"),
         (r"\+", "+"),
         (r"\^", "^"),
@@ -233,6 +230,16 @@ def test_escape_produces_literal(escaped: str, expected: str) -> None:
         n.content for n in block.children if isinstance(n, Text)
     )
     assert expected in text
+
+
+def test_double_backslash_is_hard_break() -> None:
+    """``\\\\`` in Jira wiki is a forced line break, not an escaped backslash."""
+    from cfxmark.ast import HardBreak
+
+    block = only_block("before \\\\ after")
+    assert isinstance(block, Paragraph)
+    breaks = [n for n in block.children if isinstance(n, HardBreak)]
+    assert len(breaks) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -347,17 +354,20 @@ def test_image_must_have_extension() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_color_macro_keeps_content_drops_style() -> None:
+def test_color_macro_produces_colorspan_node() -> None:
+    from cfxmark.ast import ColorSpan
+
     document, warnings, _ = parse_full(
         "Some {color:#de350b}red text{color} here"
     )
     para = document.children[0]
-    text = "".join(
-        n.content for n in para.children if isinstance(n, Text)
-    )
-    assert "red text" in text
-    assert "de350b" not in text
-    assert any("color" in w for w in warnings)
+    assert isinstance(para, Paragraph)
+    colors = [n for n in para.children if isinstance(n, ColorSpan)]
+    assert len(colors) == 1
+    assert colors[0].color == "#de350b"
+    assert colors[0].children == (Text(content="red text"),)
+    # No lossy warning — the node is preserved.
+    assert not any("dropped" in w for w in warnings)
 
 
 # ---------------------------------------------------------------------------

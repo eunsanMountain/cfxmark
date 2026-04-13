@@ -54,10 +54,13 @@ from cfxmark.ast import (
     BlockNode,
     BlockQuote,
     CellType,
+    Citation,
     CodeBlock,
+    ColorSpan,
     DirectiveMacro,
     Document,
     Emphasis,
+    HardBreak,
     Heading,
     HorizontalRule,
     Image,
@@ -71,10 +74,13 @@ from cfxmark.ast import (
     SoftBreak,
     Strikethrough,
     Strong,
+    Subscript,
+    Superscript,
     Table,
     TableCell,
     TableRow,
     Text,
+    Underline,
 )
 from cfxmark.exceptions import ParseError
 
@@ -104,14 +110,20 @@ _BLOCK_PAIRED_MACROS = frozenset(
 # Emphasis markers and their AST node class (``None`` means "drop
 # markers, keep content, emit a lossy warning" — used for sub/sup/ins
 # since cfxmark has no matching node).
-_EMPHASIS_NODE: dict[str, type | None] = {
+_EMPHASIS_NODE: dict[str, type] = {
     "*": Strong,
     "_": Emphasis,
     "-": Strikethrough,
-    "~": None,
-    "+": None,
-    "^": None,
+    "~": Subscript,
+    "+": Underline,
+    "^": Superscript,
 }
+
+# Characters that ``\`` can legitimately escape in Jira wiki. When
+# ``\`` precedes one of these, the backslash is consumed and the
+# character is emitted as literal text. Before any other character
+# the ``\`` itself is kept as a literal backslash.
+_JIRA_ESCAPABLE = frozenset("*_-~+^{}[]|\\!?")
 
 _HEADING_RE = re.compile(r"^h([1-6])\.\s+(.*)$")
 # The list marker group captures ``*`` / ``#`` / ``-`` chains. The
@@ -253,8 +265,9 @@ def _try_parse_inline_macro(
         return None
     inner = text[open_end:close_idx]
     inner_nodes = _parse_inline(inner, ctx)
-    ctx.warnings.append("color emphasis dropped (content kept)")
-    return inner_nodes, close_idx + len(close_marker)
+    color_value = m.group(2) or ""
+    color_node = ColorSpan(color=color_value, children=tuple(inner_nodes))
+    return [color_node], close_idx + len(close_marker)
 
 
 def _try_parse_link(
@@ -473,10 +486,32 @@ def _parse_inline(
     while i < n:
         ch = text[i]
 
-        # Escape — the next character is always literal.
-        if ch == "\\" and i + 1 < n:
-            buf.append(text[i + 1])
+        # HardBreak — ``\\`` is a forced line break in Jira wiki.
+        # Must be checked before the generic escape handler so that
+        # two consecutive backslashes produce a HardBreak node
+        # instead of an escaped literal backslash.
+        if ch == "\\" and i + 1 < n and text[i + 1] == "\\":
+            flush_buf()
+            nodes.append(HardBreak())
             i += 2
+            # Skip optional newline immediately after ``\\``.
+            if i < n and text[i] == "\n":
+                i += 1
+            continue
+
+        # Escape — ``\`` before a Jira-special character consumes the
+        # backslash and emits the next char as literal. Before a
+        # non-special character the ``\`` itself is kept so that
+        # ``C:\temp`` round-trips without losing the backslash.
+        if ch == "\\" and i + 1 < n:
+            nxt = text[i + 1]
+            if nxt in _JIRA_ESCAPABLE:
+                buf.append(nxt)
+                i += 2
+                continue
+            # Not a Jira-special char — keep the backslash as literal.
+            buf.append("\\")
+            i += 1
             continue
 
         # Newline inside an inline run is a soft break.
@@ -509,14 +544,14 @@ def _parse_inline(
         if ch == "[" and allow_link:
             link = _try_parse_link(text, i, ctx)
             if link is not None:
-                node, next_i = link
+                link_node, next_i = link
                 flush_buf()
-                if isinstance(node, Text) and not node.content:
+                if isinstance(link_node, Text) and not link_node.content:
                     # Dropped user mention — do not emit an empty
                     # Text node.
                     pass
                 else:
-                    nodes.append(node)
+                    nodes.append(link_node)
                 i = next_i
                 continue
 
@@ -524,10 +559,21 @@ def _parse_inline(
         if ch == "!":
             image = _try_parse_image(text, i, ctx)
             if image is not None:
-                node, next_i = image
+                img_node, next_i = image
                 flush_buf()
-                nodes.append(node)
+                nodes.append(img_node)
                 i = next_i
+                continue
+
+        # Citation ??...??
+        if ch == "?" and i + 1 < n and text[i + 1] == "?":
+            cite_close = text.find("??", i + 2)
+            if cite_close != -1:
+                inner = text[i + 2 : cite_close]
+                inner_nodes = _parse_inline(inner, ctx)
+                flush_buf()
+                nodes.append(Citation(children=tuple(inner_nodes)))
+                i = cite_close + 2
                 continue
 
         # Emphasis: * _ - ~ + ^
@@ -540,16 +586,7 @@ def _parse_inline(
                     inner_nodes = _parse_inline(inner, ctx)
                     node_cls = _EMPHASIS_NODE[ch]
                     flush_buf()
-                    if node_cls is None:
-                        # sub / sup / ins — drop markers, keep
-                        # content, emit lossy warning.
-                        ctx.warnings.append(
-                            f"Jira '{ch}' inline formatting dropped"
-                            f" (content preserved)"
-                        )
-                        nodes.extend(inner_nodes)
-                    else:
-                        nodes.append(node_cls(children=tuple(inner_nodes)))
+                    nodes.append(node_cls(children=tuple(inner_nodes)))
                     i = close + 1
                     continue
 
@@ -946,7 +983,7 @@ def _split_table_row(line: str) -> tuple[list[str], bool]:
     """Split a single table-row line into cell contents.
 
     Honours ``\\|`` as an escape for literal pipes inside cells so
-    the ``\\|\\|`` sequences in the RLM corpus round-trip as literal
+    the ``\\|\\|`` sequences in real-world fixtures round-trip as literal
     text instead of cell separators. Returns the list of raw cell
     strings and a flag telling whether the row is a header (``||``
     prefix)."""

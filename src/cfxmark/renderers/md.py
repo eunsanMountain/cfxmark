@@ -26,7 +26,9 @@ from dataclasses import dataclass
 from cfxmark.ast import (
     BlockNode,
     BlockQuote,
+    Citation,
     CodeBlock,
+    ColorSpan,
     DirectiveMacro,
     Document,
     Emphasis,
@@ -47,10 +49,13 @@ from cfxmark.ast import (
     SoftBreak,
     Strikethrough,
     Strong,
+    Subscript,
+    Superscript,
     Table,
     TableCell,
     TableRow,
     Text,
+    Underline,
 )
 from cfxmark.opaque import (
     HEADER_NOTICE,
@@ -221,6 +226,17 @@ def _render_inline_node(
         if _needs_html_fallback(inner, prev_char, next_char):
             return f"<del>{inner}</del>"
         return "~~" + inner + "~~"
+    if isinstance(node, Subscript):
+        return f"<sub>{_render_inline_text(node.children)}</sub>"
+    if isinstance(node, Superscript):
+        return f"<sup>{_render_inline_text(node.children)}</sup>"
+    if isinstance(node, Underline):
+        return f"<ins>{_render_inline_text(node.children)}</ins>"
+    if isinstance(node, ColorSpan):
+        inner = _render_inline_text(node.children)
+        return f'<span style="color:{node.color}">{inner}</span>'
+    if isinstance(node, Citation):
+        return f"<cite>{_render_inline_text(node.children)}</cite>"
     if isinstance(node, InlineCode):
         return _render_inline_code(node.content)
     if isinstance(node, Link):

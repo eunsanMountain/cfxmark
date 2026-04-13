@@ -102,6 +102,42 @@ class Image(Node):
 
 
 @dataclass(frozen=True)
+class Subscript(Node):
+    """Subscript text (Jira wiki ``~x~`` / HTML ``<sub>x</sub>``)."""
+
+    children: tuple[InlineNode, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class Superscript(Node):
+    """Superscript text (Jira wiki ``^x^`` / HTML ``<sup>x</sup>``)."""
+
+    children: tuple[InlineNode, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class Underline(Node):
+    """Underline/insert text (Jira wiki ``+x+`` / HTML ``<ins>x</ins>``)."""
+
+    children: tuple[InlineNode, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class ColorSpan(Node):
+    """Colored text (Jira wiki ``{color:red}text{color}``)."""
+
+    color: str
+    children: tuple[InlineNode, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class Citation(Node):
+    """Citation text (Jira wiki ``??text??`` / HTML ``<cite>text</cite>``)."""
+
+    children: tuple[InlineNode, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
 class InlineOpaque(Node):
     """A Confluence fragment preserved verbatim in inline position.
 
@@ -130,6 +166,11 @@ InlineNode = (
     | Emphasis
     | Strong
     | Strikethrough
+    | Subscript
+    | Superscript
+    | Underline
+    | ColorSpan
+    | Citation
     | InlineCode
     | Link
     | Image
@@ -349,6 +390,11 @@ __all__ = [
     "Emphasis",
     "Strong",
     "Strikethrough",
+    "Subscript",
+    "Superscript",
+    "Underline",
+    "ColorSpan",
+    "Citation",
     "InlineCode",
     "Link",
     "Image",

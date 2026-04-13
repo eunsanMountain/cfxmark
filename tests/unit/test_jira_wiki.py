@@ -123,10 +123,13 @@ def test_text_escape_pipe():
     assert r"a\|b" in body
 
 
-def test_text_escape_backslash():
+def test_text_backslash_not_escaped():
+    """Backslash is NOT escaped to ``\\\\`` because ``\\\\`` is a HardBreak
+    in Jira wiki. A lone ``\\`` passes through as-is."""
     d = doc(para(Text(content="a\\b")))
     body, _ = render(d)
-    assert r"a\\b" in body
+    assert "a\\b" in body
+    assert "a\\\\b" not in body
 
 
 def test_soft_break():
@@ -135,11 +138,11 @@ def test_soft_break():
     assert "a b" in body
 
 
-def test_hard_break_dropped_with_warning():
+def test_hard_break_renders_backslash():
     d = doc(para(Text(content="a"), HardBreak(), Text(content="b")))
     body, warnings = render(d)
-    assert "ab" in body or "a" in body
-    assert any("br" in w or "hard_break" in w or "dropped" in w.lower() for w in warnings)
+    assert "a\\\\\nb" in body
+    assert not any("dropped" in w.lower() for w in warnings)
 
 
 def test_strong():
@@ -235,11 +238,30 @@ def test_code_block_content_truncation_warning():
     assert any("truncat" in w.lower() or "{code}" in w for w in warnings)
 
 
-def test_blockquote_dropped_with_warning():
+def test_blockquote_renders_quote_macro():
     d = doc(BlockQuote(children=(para(Text(content="quoted")),)))
     body, warnings = render(d)
-    assert "quoted" not in body
-    assert any("blockquote" in w.lower() or "dropped" in w.lower() for w in warnings)
+    assert "{quote}" in body
+    assert "quoted" in body
+    assert not any("dropped" in w.lower() for w in warnings)
+
+
+def test_blockquote_multiple_paragraphs():
+    d = doc(BlockQuote(children=(
+        para(Text(content="first")),
+        para(Text(content="second")),
+    )))
+    body, _ = render(d)
+    assert "{quote}\nfirst\n\nsecond\n{quote}" in body
+
+
+def test_blockquote_nested_flattened_with_warning():
+    inner_bq = BlockQuote(children=(para(Text(content="inner")),))
+    d = doc(BlockQuote(children=(para(Text(content="outer")), inner_bq)))
+    body, warnings = render(d)
+    assert "outer" in body
+    assert "inner" in body
+    assert any("nested" in w.lower() or "flatten" in w.lower() for w in warnings)
 
 
 def test_horizontal_rule():
@@ -248,13 +270,57 @@ def test_horizontal_rule():
     assert "----" in body
 
 
-def test_table_dropped_with_warning():
-    cell = TableCell(kind=CellType.DATA, children=(Text(content="a"),))
+def test_table_basic_rendering():
+    header_cell = TableCell(kind=CellType.HEADER, children=(Text(content="Name"),))
+    data_cell = TableCell(kind=CellType.DATA, children=(Text(content="Alice"),))
+    header_row = TableRow(cells=(header_cell,))
+    data_row = TableRow(cells=(data_cell,))
+    d = doc(Table(header=header_row, body=(data_row,)))
+    body, warnings = render(d)
+    assert "||Name||" in body
+    assert "|Alice|" in body
+    assert not any("dropped" in w.lower() for w in warnings)
+
+
+def test_table_header_and_body():
+    h1 = TableCell(kind=CellType.HEADER, children=(Text(content="H1"),))
+    h2 = TableCell(kind=CellType.HEADER, children=(Text(content="H2"),))
+    d1 = TableCell(kind=CellType.DATA, children=(Text(content="a"),))
+    d2 = TableCell(kind=CellType.DATA, children=(Text(content="b"),))
+    header = TableRow(cells=(h1, h2))
+    row = TableRow(cells=(d1, d2))
+    d = doc(Table(header=header, body=(row,)))
+    body, _ = render(d)
+    assert "||H1||H2||" in body
+    assert "|a|b|" in body
+
+
+def test_table_body_only():
+    c1 = TableCell(kind=CellType.DATA, children=(Text(content="x"),))
+    c2 = TableCell(kind=CellType.DATA, children=(Text(content="y"),))
+    row = TableRow(cells=(c1, c2))
+    d = doc(Table(header=None, body=(row,)))
+    body, _ = render(d)
+    assert "|x|y|" in body
+
+
+def test_table_inline_formatting_in_cells():
+    cell = TableCell(kind=CellType.DATA, children=(
+        Strong(children=(Text(content="bold"),)),
+    ))
+    row = TableRow(cells=(cell,))
+    d = doc(Table(header=None, body=(row,)))
+    body, _ = render(d)
+    assert "|*bold*|" in body
+
+
+def test_table_colspan_warning():
+    cell = TableCell(kind=CellType.DATA, children=(Text(content="wide"),), colspan=2)
     row = TableRow(cells=(cell,))
     d = doc(Table(header=None, body=(row,)))
     body, warnings = render(d)
-    assert "a" not in body
-    assert any("table" in w.lower() or "dropped" in w.lower() for w in warnings)
+    assert "wide" in body
+    assert any("colspan" in w.lower() for w in warnings)
 
 
 # ---------------------------------------------------------------------------
@@ -543,7 +609,7 @@ def test_drop_leading_notice_korean_italic_preserved():
 
 
 # ---------------------------------------------------------------------------
-# Dropped-construct warning format (RLM B-4)
+# Dropped-construct warning format
 # ---------------------------------------------------------------------------
 
 
@@ -557,25 +623,28 @@ def test_no_dropped_warning_on_clean_input():
     assert warnings == []
 
 
-def test_dropped_table_warning_count_format():
-    """Three tables in one document → '<table>x3 will be dropped'."""
+def test_table_renders_without_dropped_warning():
+    """Tables are no longer dropped — three tables emit no drop warning."""
     cell = TableCell(kind=CellType.DATA, children=(Text(content="x"),))
     row = TableRow(cells=(cell,))
     table = Table(header=None, body=(row,))
     d = doc(table, table, table)
-    _, warnings = render(d)
-    assert any("<table>x3 will be dropped" in w for w in warnings)
+    body, warnings = render(d)
+    assert body.count("|x|") == 3
+    assert not any("dropped" in w.lower() for w in warnings)
 
 
-def test_dropped_blockquote_warning_count_format():
+def test_blockquote_renders_without_dropped_warning():
+    """BlockQuotes are no longer dropped."""
     bq = BlockQuote(children=(para(Text(content="quoted")),))
     d = doc(bq, bq)
-    _, warnings = render(d)
-    assert any("<blockquote>x2 will be dropped" in w for w in warnings)
+    body, warnings = render(d)
+    assert body.count("{quote}") == 4  # 2 opens + 2 closes
+    assert not any("dropped" in w.lower() for w in warnings)
 
 
-def test_dropped_hard_break_warning_count_format():
-    """HardBreak emits '<br>xN will be dropped' (one count per occurrence)."""
+def test_hard_break_renders_without_dropped_warning():
+    """HardBreak renders as \\\\ — no drop warning."""
     p = para(
         Text(content="line1"),
         HardBreak(),
@@ -584,8 +653,9 @@ def test_dropped_hard_break_warning_count_format():
         Text(content="line3"),
     )
     d = doc(p)
-    _, warnings = render(d)
-    assert any("<br>x2 will be dropped" in w for w in warnings)
+    body, warnings = render(d)
+    assert "line1\\\\\nline2\\\\\nline3" in body
+    assert not any("dropped" in w.lower() for w in warnings)
 
 
 # ---------------------------------------------------------------------------
@@ -641,7 +711,7 @@ def test_input_format_auto_doctype():
 
 
 # ---------------------------------------------------------------------------
-# HTML entity unescape via XHTML input (RLM B-3)
+# HTML entity unescape via XHTML input
 # ---------------------------------------------------------------------------
 #
 # cfxmark's AST-based renderer relies on lxml's parser to unescape XML
@@ -680,3 +750,112 @@ def test_entity_double_escape_single_pass():
     result = to_jira_wiki(xhtml, input_format="xhtml")
     assert result.jira_wiki is not None
     assert "&quot;double&quot;" in result.jira_wiki
+
+
+# ---------------------------------------------------------------------------
+# code_language_map (R7)
+# ---------------------------------------------------------------------------
+
+
+def test_code_language_map_basic():
+    d = doc(CodeBlock(content="x = 1", language="ts"))
+    body, _ = render(d, code_language_map={"ts": "javascript"})
+    assert "{code:javascript}" in body
+
+
+def test_code_language_map_none_passthrough():
+    d = doc(CodeBlock(content="x = 1", language="ts"))
+    body, _ = render(d)
+    assert "{code:ts}" in body
+
+
+def test_code_language_map_unmapped_passthrough():
+    d = doc(CodeBlock(content="x = 1", language="rust"))
+    body, _ = render(d, code_language_map={"ts": "javascript"})
+    assert "{code:rust}" in body
+
+
+def test_code_language_map_via_api():
+    result = to_jira_wiki(
+        "```ts\nconsole.log(1)\n```\n",
+        input_format="markdown",
+        code_language_map={"ts": "javascript"},
+    )
+    assert result.jira_wiki is not None
+    assert "{code:javascript}" in result.jira_wiki
+
+
+# ---------------------------------------------------------------------------
+# Subscript / Superscript / Underline (R4)
+# ---------------------------------------------------------------------------
+
+
+def test_subscript_rendering():
+    from cfxmark.ast import Subscript
+
+    d = doc(para(Text(content="H"), Subscript(children=(Text(content="2"),)), Text(content="O")))
+    body, _ = render(d)
+    assert "H~2~O" in body
+
+
+def test_superscript_rendering():
+    from cfxmark.ast import Superscript
+
+    d = doc(para(Text(content="x"), Superscript(children=(Text(content="2"),))))
+    body, _ = render(d)
+    assert "x^2^" in body
+
+
+def test_underline_rendering():
+    from cfxmark.ast import Underline
+
+    d = doc(para(Underline(children=(Text(content="important"),))))
+    body, _ = render(d)
+    assert "+important+" in body
+
+
+# ---------------------------------------------------------------------------
+# ColorSpan (R5)
+# ---------------------------------------------------------------------------
+
+
+def test_colorspan_rendering():
+    from cfxmark.ast import ColorSpan
+
+    d = doc(para(ColorSpan(color="red", children=(Text(content="alert"),))))
+    body, _ = render(d)
+    assert "{color:red}alert{color}" in body
+
+
+def test_colorspan_round_trip():
+    from cfxmark.api import from_jira_wiki
+
+    result = from_jira_wiki("{color:#de350b}important{color}")
+    assert result.markdown is not None
+    assert "important" in result.markdown
+    # Check no "dropped" warning
+    assert not any("dropped" in w for w in result.warnings)
+    # Round-trip back to Jira wiki
+    wiki_result = to_jira_wiki(result.markdown, input_format="markdown", heading_promotion="jira")
+    assert wiki_result.jira_wiki is not None
+
+
+# ---------------------------------------------------------------------------
+# Citation (R6)
+# ---------------------------------------------------------------------------
+
+
+def test_citation_rendering():
+    from cfxmark.ast import Citation
+
+    d = doc(para(Citation(children=(Text(content="reference"),))))
+    body, _ = render(d)
+    assert "??reference??" in body
+
+
+def test_citation_parsing_round_trip():
+    from cfxmark.api import from_jira_wiki
+
+    result = from_jira_wiki("??cited text??")
+    assert result.markdown is not None
+    assert "cited text" in result.markdown

@@ -236,6 +236,7 @@ def to_jira_wiki(
     section: str | None = None,
     drop_leading_notice: tuple[re.Pattern[str], ...] = (),
     heading_promotion: Literal["confluence", "jira", "none"] = "confluence",
+    code_language_map: dict[str, str] | None = None,
     options: ConversionOptions | None = None,
     macros: MacroRegistry | None = None,
 ) -> ConversionResult:
@@ -257,6 +258,10 @@ def to_jira_wiki(
         pushing to a Confluence page where the page title occupies
         the top slot, or ``"jira"``/``"none"`` for a 1:1 identity
         mapping when pushing to a Jira issue ``description``.
+    :param code_language_map: Optional mapping of code block language
+        identifiers to normalized forms (e.g.
+        ``{"ts": "javascript"}``). ``None`` (default) passes
+        languages through unchanged.
     :param options: Conversion options. Only
         :attr:`ConversionOptions.passthrough_html_comment_prefixes`
         affects the Jira wiki pipeline — matching HTML comments on
@@ -288,6 +293,7 @@ def to_jira_wiki(
         section=section,
         drop_leading_notice=drop_leading_notice,
         heading_promotion=heading_promotion,
+        code_language_map=code_language_map,
     )
     warnings.extend(render_warnings)
     return ConversionResult(

@@ -32,7 +32,9 @@ from cfxmark.ast import (
     BlockQuote,
     CellAlign,
     CellType,
+    Citation,
     CodeBlock,
+    ColorSpan,
     DirectiveMacro,
     Document,
     Emphasis,
@@ -53,10 +55,13 @@ from cfxmark.ast import (
     SoftBreak,
     Strikethrough,
     Strong,
+    Subscript,
+    Superscript,
     Table,
     TableCell,
     TableRow,
     Text,
+    Underline,
 )
 from cfxmark.exceptions import ParseError
 from cfxmark.macros import MacroRegistry, default_registry
@@ -543,6 +548,11 @@ class _MdConverter:
         "i": Emphasis,
         "del": Strikethrough,
         "s": Strikethrough,
+        "sub": Subscript,
+        "sup": Superscript,
+        "ins": Underline,
+        "u": Underline,
+        "cite": Citation,
     }
 
     def _convert_span_sequence(
@@ -578,6 +588,16 @@ class _MdConverter:
                     out.append(HardBreak())
                     i += 1
                     continue
+                if kind == "open" and tag == "span":
+                    # Try to extract color from style attribute.
+                    color = _extract_span_color(raw)
+                    if color is not None:
+                        inner, next_i = self._convert_span_sequence(
+                            tokens, i + 1, "span"
+                        )
+                        out.append(ColorSpan(color=color, children=tuple(inner)))
+                        i = next_i
+                        continue
                 # Unknown HTML span — drop with warning (same policy as
                 # the non-span HTMLSpan handler).
                 self.warnings.append(
@@ -755,6 +775,16 @@ def _html_span_match(
     if m := _HTML_OPEN_RE.match(content):
         return "open", m.group(1).lower()
     return None
+
+
+_SPAN_COLOR_RE = re.compile(r'style="[^"]*color:\s*([^;"\']+)')
+
+
+def _extract_span_color(token: span_token.SpanToken) -> str | None:
+    """Return the ``color`` value from ``<span style="color:...">`` or None."""
+    content = getattr(token, "content", "") or ""
+    m = _SPAN_COLOR_RE.search(content)
+    return m.group(1).strip() if m else None
 
 
 _COLSPAN_MARK = "<"

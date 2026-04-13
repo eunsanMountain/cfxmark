@@ -22,12 +22,12 @@ result.warnings       # tuple
 result = cfxmark.to_jira_wiki(markdown_text)
 result.jira_wiki      # str | None — Jira wiki markup
 
-# Jira wiki markup → Markdown  (EXPERIMENTAL, LOSSY — v0.3+)
+# Jira wiki markup → Markdown  (EXPERIMENTAL — v0.3+, enhanced v0.4)
 from cfxmark.jira import from_jira_wiki
 result = from_jira_wiki(jira_issue_description)
 result.markdown       # str
 result.attachments    # tuple  — filenames referenced via [^file] / !file!
-result.warnings       # tuple  — dropped colours, unsupported sub/sup/ins, …
+result.warnings       # tuple  — unsupported user mentions, …
 ```
 
 `ConversionResult` is the same dataclass for all directions —
@@ -365,6 +365,16 @@ result = cfxmark.to_jira_wiki(
 )
 ```
 
+Code block language identifiers can be normalised for Jira Server
+compatibility:
+
+```python
+result = cfxmark.to_jira_wiki(
+    markdown_text,
+    code_language_map={"ts": "javascript", "kotlin": "java"},
+)
+```
+
 `result.jira_wiki` is `None` when `section=` is specified but not
 found in the document.
 
@@ -470,11 +480,12 @@ Explicitly **allowed** canonicalization (not considered a diff):
 
 - Heading spacing, list indent, trailing whitespace normalisation
 - Soft-break inside a paragraph collapsed into a single line
-- Jira colour emphasis (`{color:#hex}text{color}`) dropped; content kept
 - Jira `{panel}` macro mapped to `{note}` admonition
 - `_italic_` canonicalised to Markdown `*italic*`
 - `-strike-` canonicalised to Markdown `~~strike~~`
-- `~sub~` / `+ins+` / `^sup^` dropped with markers removed, content kept
+- `~sub~` → `<sub>`, `^sup^` → `<sup>`, `+ins+` → `<ins>` (v0.4+)
+- `{color:#hex}text{color}` → `<span style="color:#hex">text</span>` (v0.4+)
+- `??text??` → `<cite>text</cite>` (v0.4+)
 
 Explicitly **forbidden** (would break the contract):
 
@@ -493,8 +504,11 @@ Explicitly **forbidden** (would break the contract):
 | `_italic_`                   | `*italic*`                               |                                          |
 | `-strike-`                   | `~~strike~~`                             | boundary-aware                           |
 | `{{mono}}`                   | `` `mono` ``                             |                                          |
-| `~sub~`, `+ins+`, `^sup^`    | plain text                               | markers dropped, content kept + warning  |
-| `{color:#hex}x{color}`       | `x`                                      | colour dropped + warning                 |
+| `~sub~`                      | `<sub>sub</sub>`                         | Subscript node (v0.4+)                   |
+| `^sup^`                      | `<sup>sup</sup>`                         | Superscript node (v0.4+)                 |
+| `+ins+`                      | `<ins>ins</ins>`                         | Underline node (v0.4+)                   |
+| `{color:#hex}x{color}`       | `<span style="color:#hex">x</span>`     | ColorSpan node (v0.4+)                   |
+| `??text??`                   | `<cite>text</cite>`                      | Citation node (v0.4+)                    |
 | `[url]`                      | `[url](url)` (empty label form)          |                                          |
 | `[label\|url]`               | `[label](url)`                           | label may contain nested `[...]`         |
 | `[^file.png]`                | `![](file.png)`                          | when extension is image-like             |

@@ -12,7 +12,9 @@ from cfxmark.ast import (
     BlockNode,
     BlockQuote,
     CellType,
+    Citation,
     CodeBlock,
+    ColorSpan,
     DirectiveMacro,
     Document,
     Emphasis,
@@ -33,9 +35,12 @@ from cfxmark.ast import (
     SoftBreak,
     Strikethrough,
     Strong,
+    Subscript,
+    Superscript,
     Table,
     TableCell,
     Text,
+    Underline,
 )
 from cfxmark.exceptions import ConversionError
 from cfxmark.macros import MacroRegistry, default_registry
@@ -107,6 +112,27 @@ def _render_inline(
             last_child = el
         elif isinstance(node, Strikethrough):
             el = ET.SubElement(parent, "del")
+            _render_inline(node.children, el, ctx)
+            last_child = el
+        elif isinstance(node, Subscript):
+            el = ET.SubElement(parent, "sub")
+            _render_inline(node.children, el, ctx)
+            last_child = el
+        elif isinstance(node, Superscript):
+            el = ET.SubElement(parent, "sup")
+            _render_inline(node.children, el, ctx)
+            last_child = el
+        elif isinstance(node, Underline):
+            el = ET.SubElement(parent, "ins")
+            _render_inline(node.children, el, ctx)
+            last_child = el
+        elif isinstance(node, ColorSpan):
+            el = ET.SubElement(parent, "span")
+            el.set("style", f"color:{node.color}")
+            _render_inline(node.children, el, ctx)
+            last_child = el
+        elif isinstance(node, Citation):
+            el = ET.SubElement(parent, "cite")
             _render_inline(node.children, el, ctx)
             last_child = el
         elif isinstance(node, InlineCode):
