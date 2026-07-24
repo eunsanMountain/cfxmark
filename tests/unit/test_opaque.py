@@ -24,7 +24,7 @@ def test_serialize_round_trip() -> None:
 def test_unknown_macro_preserves_macro_id() -> None:
     cfx = (
         '<ac:structured-macro ac:name="custom" ac:macro-id="abc-123-uuid">'
-        "<ac:parameter ac:name=\"k\">v</ac:parameter>"
+        '<ac:parameter ac:name="k">v</ac:parameter>'
         "</ac:structured-macro>"
     )
     md = cfxmark.to_md(cfx).markdown
@@ -36,7 +36,7 @@ def test_unknown_macro_preserves_macro_id() -> None:
 def test_round_trip_through_opaque_is_byte_stable() -> None:
     cfx = (
         '<ac:structured-macro ac:name="custom-thing">'
-        "<ac:parameter ac:name=\"foo\">bar</ac:parameter>"
+        '<ac:parameter ac:name="foo">bar</ac:parameter>'
         "<ac:rich-text-body><p>body</p></ac:rich-text-body>"
         "</ac:structured-macro>"
     )

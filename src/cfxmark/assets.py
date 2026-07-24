@@ -28,11 +28,19 @@ import logging
 import mimetypes
 import re
 from collections.abc import Callable
+from dataclasses import fields
 from pathlib import Path
 from typing import Literal
+from urllib.parse import quote
 
-from cfxmark.exceptions import AssetSecurityError
-from cfxmark.opaque import _ASSET_MARKER_RE, serialize_asset_marker
+from cfxmark.ast import InlineOpaque, Node, OpaqueBlock
+from cfxmark.exceptions import AssetSecurityError, ParseError
+from cfxmark.image_metadata import marker_transport_path, render_link_destination, visible_target_matches_attachment
+from cfxmark.opaque import (
+    find_asset_marker_occurrences,
+    serialize_asset_marker,
+)
+from cfxmark.parsers.cfx import _enumerate_attachment_names
 
 _log = logging.getLogger("cfxmark.assets")
 
@@ -100,7 +108,6 @@ def resolve_assets(
         if asset_dir is None:
             raise ValueError("resolve_assets(mode='sidecar') requires asset_dir=")
         asset_dir_path = Path(asset_dir)
-        asset_dir_path.mkdir(parents=True, exist_ok=True)
         if strict_filenames:
             # Resolve once outside the loop so per-attachment writes only
             # need to resolve the candidate path.
@@ -117,18 +124,60 @@ def resolve_assets(
     # string piece by piece.
     out_parts: list[str] = []
     cursor = 0
-    for marker in _ASSET_MARKER_RE.finditer(md):
-        original_src = marker.group("src")
+    marker_occurrences = find_asset_marker_occurrences(md, validate_remote_source=False)
+    marker_plans = []
+    for marker in marker_occurrences:
+        original_src = marker.remote_src
+        link = marker.link
+        visible_src = link.target
+        fragment = _cfxmark_fragment(visible_src)
+        if fragment and visible_src == original_src:
+            # Reserved-looking text in the exact typed remote filename is
+            # literal, not visible-link metadata.
+            fragment = ""
+        elif fragment and not visible_target_matches_attachment(_strip_cfxmark_fragment(visible_src), original_src):
+            raise ParseError("legacy image metadata target is ambiguous for the asset marker")
 
-        # Find the image link immediately preceding the marker.
-        link_span = _find_preceding_image_link(md, marker.start())
-        if link_span is None:
-            # Marker without a paired link — leave the surrounding
-            # text alone.
-            continue
-        link_start, link_end, alt, _visible_src, title = link_span
+        transport_source = _strip_cfxmark_fragment(visible_src) if fragment else visible_src
+        marker_transport_path(transport_source, original_src)
 
         _guard_filename(original_src, strict=strict_filenames)
+        if mode == "sidecar" and strict_filenames:
+            assert asset_dir_path is not None
+            assert resolved_base is not None
+            _safe_resolve(resolved_base, asset_dir_path / original_src)
+        marker_plans.append((marker, fragment))
+
+    seen = {item.remote_src for item in marker_occurrences}
+    opaque_filenames: list[str] = []
+    if mode == "sidecar":
+        assert asset_dir_path is not None
+        for raw_xml in _authenticated_opaque_xml(md):
+            for filename in _enumerate_attachment_names(raw_xml):
+                if filename in seen:
+                    continue
+                seen.add(filename)
+                _guard_filename(filename, strict=strict_filenames)
+                if strict_filenames:
+                    assert resolved_base is not None
+                    _safe_resolve(resolved_base, asset_dir_path / filename)
+                opaque_filenames.append(filename)
+
+        # Directory creation is delayed until the complete document plan has
+        # passed validation, so a later unsafe occurrence has no local effect.
+        if marker_plans or opaque_filenames:
+            asset_dir_path.mkdir(parents=True, exist_ok=True)
+
+    for marker, fragment in marker_plans:
+        original_src = marker.remote_src
+        link = marker.link
+        link_start, link_end, alt, visible_src, title = (
+            link.start,
+            link.end,
+            link.alt,
+            link.target,
+            link.title,
+        )
 
         bytes_data = fetcher(original_src)
         if bytes_data is None:
@@ -140,19 +189,28 @@ def resolve_assets(
         else:
             assert asset_dir_path is not None
             _write_asset(
-                asset_dir_path, resolved_base, original_src, bytes_data,
+                asset_dir_path,
+                resolved_base,
+                original_src,
+                bytes_data,
                 strict=strict_filenames,
             )
-            new_target = f"{link_base}{original_src}" if link_base else original_src
+            relative_path = f"{link_base}{original_src}" if link_base else original_src
+            new_target = quote(relative_path, safe="/")
+        if fragment:
+            separator = "&" if "#" in new_target else "#"
+            new_target = f"{new_target}{separator}{fragment}"
 
         out_parts.append(md[cursor:link_start])
+        destination = render_link_destination(new_target)
         if title:
-            new_link = f'![{alt}]({new_target} "{title}")'
+            new_link = f'![{alt}]({destination} "{title}")'
         else:
-            new_link = f"![{alt}]({new_target})"
+            new_link = f"![{alt}]({destination})"
         out_parts.append(new_link)
+        out_parts.append(md[link_end : marker.start])
         out_parts.append(serialize_asset_marker(original_src))
-        cursor = marker.end()
+        cursor = marker.end
 
     out_parts.append(md[cursor:])
     result = "".join(out_parts)
@@ -165,21 +223,41 @@ def resolve_assets(
     # text), so we leave it alone there.
     if mode == "sidecar":
         assert asset_dir_path is not None
-        seen = {m.group("src") for m in _ASSET_MARKER_RE.finditer(result)}
-        for filename in _OPAQUE_RI_FILENAME_RE.findall(_CDATA_RE.sub("", result)):
-            if filename in seen:
-                continue
-            seen.add(filename)
-            _guard_filename(filename, strict=strict_filenames)
+        for filename in opaque_filenames:
             bytes_data = fetcher(filename)
             if bytes_data is None:
                 continue
             _write_asset(
-                asset_dir_path, resolved_base, filename, bytes_data,
+                asset_dir_path,
+                resolved_base,
+                filename,
+                bytes_data,
                 strict=strict_filenames,
             )
 
     return result
+
+
+_CFXMARK_FRAGMENT_RE = re.compile(r"cfxmark:[^\s)]+")
+
+
+def _cfxmark_fragment(target: str) -> str:
+    """Return cfxmark image metadata from a visible link target."""
+
+    match = _CFXMARK_FRAGMENT_RE.search(target)
+    return match.group(0) if match else ""
+
+
+def _strip_cfxmark_fragment(target: str) -> str:
+    """Remove one resolver-recognized legacy metadata fragment."""
+
+    match = _CFXMARK_FRAGMENT_RE.search(target)
+    if match is None:
+        return target
+    start = match.start()
+    if start > 0 and target[start - 1] in "#&":
+        start -= 1
+    return (target[:start] + target[match.end() :]).rstrip("#&")
 
 
 # ---------------------------------------------------------------------------
@@ -214,9 +292,7 @@ def _safe_resolve(resolved_base: Path, candidate: Path) -> Path:
     except (OSError, RuntimeError) as ex:
         raise AssetSecurityError(str(candidate), f"resolve failed: {ex}") from ex
     if not resolved_cand.is_relative_to(resolved_base):
-        raise AssetSecurityError(
-            str(candidate), f"resolves outside base directory {resolved_base}"
-        )
+        raise AssetSecurityError(str(candidate), f"resolves outside base directory {resolved_base}")
     return resolved_cand
 
 
@@ -258,48 +334,29 @@ def _write_asset(
     dest.write_bytes(bytes_data)
 
 
-_OPAQUE_RI_FILENAME_RE = re.compile(r'<ri:attachment[^>]*ri:filename="([^"]+)"')
-_CDATA_RE = re.compile(r"<!\[CDATA\[.*?\]\]>", re.DOTALL)
+def _authenticated_opaque_xml(markdown: str) -> tuple[str, ...]:
+    """Return raw XML only from semantically reachable authenticated nodes."""
 
+    from cfxmark.parsers.md import parse_md
 
-_IMAGE_LINK_RE = re.compile(
-    r'!\[(?P<alt>(?:\\.|[^\]\\])*)\]\((?P<target>[^\s)]+)(?:\s+"(?P<title>(?:\\.|[^"\\])*)")?\)',
-)
+    document, _warnings = parse_md(markdown, validate_asset_marker_sources=False)
+    raw_sources: list[str] = []
 
+    def visit(node: Node) -> None:
+        if isinstance(node, (OpaqueBlock, InlineOpaque)):
+            raw_sources.append(node.raw_xml)
+            return
+        for item in fields(node):
+            value = getattr(node, item.name)
+            if isinstance(value, Node):
+                visit(value)
+            elif isinstance(value, tuple):
+                for member in value:
+                    if isinstance(member, Node):
+                        visit(member)
 
-def _find_preceding_image_link(
-    text: str,
-    marker_start: int,
-) -> tuple[int, int, str, str, str | None] | None:
-    """Find the image link immediately to the left of ``marker_start``.
-
-    Returns ``(start, end, alt, target, title)`` or ``None`` if no
-    image link sits adjacent (allowing only whitespace) to the marker.
-    """
-
-    # Scan back to the nearest non-whitespace position before the marker.
-    i = marker_start
-    while i > 0 and text[i - 1] in " \t":
-        i -= 1
-    # The link must end at exactly position ``i`` (no other text in
-    # between). Walk back to find a matching ``![``.
-    if i < 2 or text[i - 1] != ")":
-        return None
-    # Find the start of the image link by scanning back for "![".
-    bang = text.rfind("![", 0, i)
-    if bang < 0:
-        return None
-    candidate = text[bang:i]
-    m = _IMAGE_LINK_RE.fullmatch(candidate)
-    if m is None:
-        return None
-    return (
-        bang,
-        i,
-        m.group("alt"),
-        m.group("target"),
-        m.group("title"),
-    )
+    visit(document)
+    return tuple(raw_sources)
 
 
 def _data_uri(filename: str, data: bytes) -> str:

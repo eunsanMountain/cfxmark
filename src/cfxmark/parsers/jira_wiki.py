@@ -93,9 +93,7 @@ from cfxmark.exceptions import ParseError
 # or ``!file.ext!`` syntax. Everything else (``.msg``, ``.docx``, …)
 # becomes a ``Link`` with an ``attachment:`` URL scheme so the
 # wrapper can fetch it out-of-band.
-_IMAGE_EXTENSIONS = frozenset(
-    {"png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "tiff", "ico"}
-)
+_IMAGE_EXTENSIONS = frozenset({"png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "tiff", "ico"})
 
 # Known admonition macros that map to cfxmark's built-in flavours.
 _ADMONITION_MACROS = frozenset({"info", "note", "warning", "tip"})
@@ -103,9 +101,7 @@ _ADMONITION_MACROS = frozenset({"info", "note", "warning", "tip"})
 # Block-level paired macros. Each one opens with ``{name}`` or
 # ``{name:params}`` on its own line (possibly with trailing text) and
 # closes with ``{name}`` on its own line.
-_BLOCK_PAIRED_MACROS = frozenset(
-    {"code", "noformat", "quote", "info", "note", "warning", "tip", "panel"}
-)
+_BLOCK_PAIRED_MACROS = frozenset({"code", "noformat", "quote", "info", "note", "warning", "tip", "panel"})
 
 # Emphasis markers and their AST node class (``None`` means "drop
 # markers, keep content, emit a lossy warning" — used for sub/sup/ins
@@ -238,9 +234,7 @@ def _find_emphasis_close(text: str, start: int, marker: str) -> int | None:
     return None
 
 
-def _try_parse_inline_macro(
-    text: str, start: int, ctx: _ParseContext
-) -> tuple[list[InlineNode], int] | None:
+def _try_parse_inline_macro(text: str, start: int, ctx: _ParseContext) -> tuple[list[InlineNode], int] | None:
     """Try to parse a paired inline macro (e.g. ``{color:#hex}...{color}``).
 
     Returns ``(nodes, next_index)`` on success or ``None`` on no
@@ -270,9 +264,7 @@ def _try_parse_inline_macro(
     return [color_node], close_idx + len(close_marker)
 
 
-def _try_parse_link(
-    text: str, start: int, ctx: _ParseContext
-) -> tuple[InlineNode, int] | None:
+def _try_parse_link(text: str, start: int, ctx: _ParseContext) -> tuple[InlineNode, int] | None:
     """Try to parse a Jira link starting at ``text[start]`` (which is
     ``[``).
 
@@ -366,9 +358,7 @@ def _try_parse_link(
     return Link(url=url, children=tuple(label_nodes)), next_i
 
 
-def _try_parse_image(
-    text: str, start: int, ctx: _ParseContext
-) -> tuple[Image, int] | None:
+def _try_parse_image(text: str, start: int, ctx: _ParseContext) -> tuple[Image, int] | None:
     """Try to parse ``!filename.ext!`` or
     ``!filename.ext|alt=foo,width=123!``.
 
@@ -400,31 +390,73 @@ def _try_parse_image(
     next_i = i + 1
     if not _is_emphasis_right_boundary(text, next_i):
         return None
-    if not inner or " " in inner.split("|", 1)[0] or "." not in inner.split("|", 1)[0]:
+    parts = _split_unescaped(inner, "|", maxsplit=1)
+    if not inner or " " in parts[0] or "." not in parts[0]:
         return None
-    parts = inner.split("|", 1)
     filename = parts[0]
     alt = ""
     width: int | None = None
     height: int | None = None
+    thumbnail = False
+    align: str | None = None
     if len(parts) == 2:
-        for kv in parts[1].split(","):
+        for kv in _split_unescaped(parts[1], ","):
             key, _, val = kv.partition("=")
             key = key.strip()
-            val = val.strip()
+            val = _unescape(val.strip())
             if key == "alt":
                 alt = val
             elif key == "width" and val.isdigit():
                 width = int(val)
             elif key == "height" and val.isdigit():
                 height = int(val)
-    ctx.add_attachment(filename)
-    return Image(src=filename, alt=alt, width=width, height=height), next_i
+            elif key == "thumbnail" and val.lower() in {"", "1", "true"}:
+                thumbnail = True
+            elif key == "align" and val in {"center", "right"}:
+                align = val
+    filename = _unescape(filename)
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", filename):
+        ctx.add_attachment(filename)
+    return Image(
+        src=filename,
+        alt=alt,
+        width=width,
+        height=height,
+        thumbnail=thumbnail,
+        align=align,
+    ), next_i
 
 
-def _try_parse_monospace(
-    text: str, start: int
-) -> tuple[InlineCode, int] | None:
+def _split_unescaped(text: str, delimiter: str, *, maxsplit: int = -1) -> list[str]:
+    """Split on delimiters not protected by a Jira backslash escape.
+
+    Escapes remain in the returned fields so the caller can parse the
+    surrounding grammar before applying :func:`_unescape` exactly once.
+    """
+
+    parts: list[str] = []
+    field: list[str] = []
+    splits = 0
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text):
+            field.extend((ch, text[i + 1]))
+            i += 2
+            continue
+        if ch == delimiter and (maxsplit < 0 or splits < maxsplit):
+            parts.append("".join(field))
+            field.clear()
+            splits += 1
+            i += 1
+            continue
+        field.append(ch)
+        i += 1
+    parts.append("".join(field))
+    return parts
+
+
+def _try_parse_monospace(text: str, start: int) -> tuple[InlineCode, int] | None:
     """Try to parse ``{{content}}`` monospace."""
     if text[start : start + 2] != "{{":
         return None
@@ -705,9 +737,7 @@ def _code_language_from_params(
     return None
 
 
-def _consume_paragraph(
-    lines: list[str], start: int, ctx: _ParseContext
-) -> tuple[Paragraph, int]:
+def _consume_paragraph(lines: list[str], start: int, ctx: _ParseContext) -> tuple[Paragraph, int]:
     i = start
     n = len(lines)
     buf: list[str] = []
@@ -805,9 +835,7 @@ def _consume_paired_macro(
         # D4: map panel → note admonition with a lossy warning so the
         # caller knows the mapping happened. The ``title=`` parameter
         # is preserved so the renderer can echo it.
-        ctx.warnings.append(
-            "{panel} macro mapped to {note} admonition (lossy)"
-        )
+        ctx.warnings.append("{panel} macro mapped to {note} admonition (lossy)")
         inner_blocks = _parse_blocks(body_text, ctx)
         return (
             DirectiveMacro(
@@ -822,9 +850,7 @@ def _consume_paired_macro(
     return None, start
 
 
-def _consume_blockquote_line(
-    lines: list[str], start: int, ctx: _ParseContext
-) -> tuple[BlockQuote, int]:
+def _consume_blockquote_line(lines: list[str], start: int, ctx: _ParseContext) -> tuple[BlockQuote, int]:
     line = lines[start]
     m = _BLOCKQUOTE_RE.match(line.lstrip())
     assert m is not None
@@ -862,9 +888,7 @@ def _normalize_list_marker(raw: str) -> str:
     return "".join(out)
 
 
-def _consume_list(
-    lines: list[str], start: int, ctx: _ParseContext
-) -> tuple[List, int]:
+def _consume_list(lines: list[str], start: int, ctx: _ParseContext) -> tuple[List, int]:
     """Consume a Jira wiki list (possibly nested) and return a single
     top-level :class:`List` plus the next line index.
 
@@ -875,6 +899,7 @@ def _consume_list(
     """
 
     raw_items: list[_RawListItem] = []
+    top_marker_type: str | None = None
     i = start
     n = len(lines)
     while i < n:
@@ -887,7 +912,11 @@ def _consume_list(
                 j = i + 1
                 while j < n and not lines[j].strip():
                     j += 1
-                if j < n and _LIST_MARKER_RE.match(lines[j]):
+                next_match = _LIST_MARKER_RE.match(lines[j]) if j < n else None
+                if next_match is not None:
+                    next_marker = _normalize_list_marker(next_match.group(1))
+                    if top_marker_type is not None and next_marker[0] != top_marker_type:
+                        break
                     i = j
                     continue
                 break
@@ -895,6 +924,8 @@ def _consume_list(
             # of the previous item (lazy continuation). Jira wiki
             # allows this in practice; attach to the previous item.
             if raw_items:
+                if _line_terminates_paragraph(line):
+                    break
                 raw_items[-1].continuation.append(line)
                 i += 1
                 continue
@@ -902,6 +933,10 @@ def _consume_list(
         try:
             marker = _normalize_list_marker(m.group(1))
         except ValueError:
+            break
+        if top_marker_type is None:
+            top_marker_type = marker[0]
+        elif marker[0] != top_marker_type:
             break
         # ``m.group(2)`` is None when the line is a bare marker with
         # no trailing content (``-\n`` with nothing after it); treat
@@ -969,9 +1004,7 @@ def _build_nested_list(
         # Recurse for nested items.
         nested_raw = items[i + 1 : j]
         if nested_raw:
-            nested_list = _build_nested_list(
-                nested_raw, ctx, prefix=prefix + first_char
-            )
+            nested_list = _build_nested_list(nested_raw, ctx, prefix=prefix + first_char)
             children_blocks.append(nested_list)
         list_items.append(ListItem(children=tuple(children_blocks)))
         i = j
@@ -990,28 +1023,36 @@ def _split_table_row(line: str) -> tuple[list[str], bool]:
 
     s = line.lstrip()
     is_header = s.startswith("||")
-    # Normalize delimiter: for a header row, ``||x||y||`` becomes
-    # ``|x|y|`` so we can use a single split path.
-    if is_header:
-        s = s.replace("||", "|")
+    delimiter = "||" if is_header else "|"
     cells: list[str] = []
     buf: list[str] = []
     i = 0
     n = len(s)
     if n == 0 or s[0] != "|":
         return [], is_header
-    i = 1  # Skip the leading ``|``.
+    i = len(delimiter)
+    in_monospace = False
     while i < n:
+        if s.startswith("{{", i):
+            in_monospace = True
+            buf.extend(("{", "{"))
+            i += 2
+            continue
+        if in_monospace and s.startswith("}}", i):
+            in_monospace = False
+            buf.extend(("}", "}"))
+            i += 2
+            continue
         ch = s[i]
         if ch == "\\" and i + 1 < n:
             buf.append(s[i])
             buf.append(s[i + 1])
             i += 2
             continue
-        if ch == "|":
+        if not in_monospace and s.startswith(delimiter, i):
             cells.append("".join(buf))
             buf.clear()
-            i += 1
+            i += len(delimiter)
             continue
         buf.append(ch)
         i += 1
@@ -1023,9 +1064,7 @@ def _split_table_row(line: str) -> tuple[list[str], bool]:
     return cells, is_header
 
 
-def _consume_table(
-    lines: list[str], start: int, ctx: _ParseContext
-) -> tuple[Table, int]:
+def _consume_table(lines: list[str], start: int, ctx: _ParseContext) -> tuple[Table, int]:
     """Consume a Jira wiki table.
 
     Multi-line cells are supported: a line that does not itself begin
@@ -1066,9 +1105,7 @@ def _consume_table(
         # different block. Without this guard the table greedily eats
         # trailing content like ``h3. *TO-BE*`` that happens to sit
         # right after the last row with no blank separator.
-        if row_sources and not _line_terminates_paragraph(
-            line, inside_table=True
-        ):
+        if row_sources and not _line_terminates_paragraph(line, inside_table=True):
             row_sources[-1] = row_sources[-1] + "\n" + line
             i += 1
             continue

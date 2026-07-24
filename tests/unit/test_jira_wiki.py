@@ -247,10 +247,14 @@ def test_blockquote_renders_quote_macro():
 
 
 def test_blockquote_multiple_paragraphs():
-    d = doc(BlockQuote(children=(
-        para(Text(content="first")),
-        para(Text(content="second")),
-    )))
+    d = doc(
+        BlockQuote(
+            children=(
+                para(Text(content="first")),
+                para(Text(content="second")),
+            )
+        )
+    )
     body, _ = render(d)
     assert "{quote}\nfirst\n\nsecond\n{quote}" in body
 
@@ -305,9 +309,7 @@ def test_table_body_only():
 
 
 def test_table_inline_formatting_in_cells():
-    cell = TableCell(kind=CellType.DATA, children=(
-        Strong(children=(Text(content="bold"),)),
-    ))
+    cell = TableCell(kind=CellType.DATA, children=(Strong(children=(Text(content="bold"),)),))
     row = TableRow(cells=(cell,))
     d = doc(Table(header=None, body=(row,)))
     body, _ = render(d)
@@ -519,14 +521,12 @@ def test_section_cdata_inside_macro_does_not_truncate():
         "<h2>Story Summary</h2>"
         "<p>real summary</p>"
         '<ac:structured-macro ac:name="code">'
-        '<ac:plain-text-body><![CDATA[## Story Summary]]></ac:plain-text-body>'
+        "<ac:plain-text-body><![CDATA[## Story Summary]]></ac:plain-text-body>"
         "</ac:structured-macro>"
         "<h2>Next Section</h2>"
         "<p>excluded</p>"
     )
-    result = to_jira_wiki(
-        xhtml, input_format="xhtml", section="Story Summary"
-    )
+    result = to_jira_wiki(xhtml, input_format="xhtml", section="Story Summary")
     assert result.jira_wiki is not None
     assert "real summary" in result.jira_wiki
     assert "excluded" not in result.jira_wiki
@@ -597,9 +597,7 @@ def test_drop_leading_notice_korean_italic_preserved():
     """A legitimate Korean one-liner italic summary survives when no
     pattern matches. The drop is policy-neutral — only paragraphs
     matching a caller-supplied regex are removed."""
-    p_summary = para(
-        Emphasis(children=(Text(content="요약: 신규 기능 추가"),))
-    )
+    p_summary = para(Emphasis(children=(Text(content="요약: 신규 기능 추가"),)))
     p_body = para(Text(content="본문 내용"))
     d = doc(p_summary, p_body)
     # Pattern matches English NOTICE template — Korean italic must survive
@@ -726,7 +724,7 @@ def test_entity_basic_lt_gt_amp_quot():
     xhtml = "<p>a &lt; b &amp; c &gt; d &quot;e&quot;</p>"
     result = to_jira_wiki(xhtml, input_format="xhtml")
     assert result.jira_wiki is not None
-    assert "a < b & c > d \"e\"" in result.jira_wiki
+    assert 'a < b & c > d "e"' in result.jira_wiki
 
 
 def test_entity_numeric_decimal():

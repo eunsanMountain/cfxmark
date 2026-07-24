@@ -1,8 +1,8 @@
 # cfxmark
 
 **Bidirectional Markdown ↔ Confluence Storage XHTML converter** —
-with lossless opaque preservation for everything cfxmark doesn't
-explicitly know how to convert.
+with explicit migration reports, managed Markdown projections, and
+source-bound ownership proof for publishing edited remote content.
 
 ```python
 import cfxmark
@@ -32,7 +32,57 @@ result.warnings       # tuple  — unsupported user mentions, …
 
 `ConversionResult` is the same dataclass for all directions —
 `xhtml` is populated for `to_cfx`, `markdown` for `to_md` /
-`from_jira_wiki`, and `jira_wiki` for `to_jira_wiki`.
+`from_jira_wiki`, and `jira_wiki` for `to_jira_wiki`. Confluence
+conversions also expose `push_safe` and `losses` so callers can keep
+read-only output separate from editable round-trip output.
+
+### Markdown profiles
+
+`ConversionOptions(profile=...)` selects the Confluence-to-Markdown
+contract:
+
+- `legacy` is the backward-compatible default and preserves unknown
+  content through the existing opaque XML sidecar format.
+- `editable` emits semantic Markdown, compact color categories, image
+  metadata, and alignment markers. It sets `push_safe=False` and emits
+  an unsupported-content marker when a construct cannot be represented
+  without raw XML. Unsupported markers name the macro when available, remain
+  stable across normalization, and are rejected by `to_cfx()`.
+- `readable` removes round-trip-only visual metadata for concise reading.
+  Its output is always `push_safe=False` and should not be published.
+
+```python
+editable = cfxmark.to_md(
+    xhtml,
+    options=cfxmark.ConversionOptions(profile="editable"),
+)
+if not editable.push_safe:
+    raise ValueError("page contains unsupported content")
+```
+
+Known colors use compact names such as `red`, `green`, and `amber`. An exact
+color outside the known palette remains in `data-cfx-color` and produces a
+warning, so state-bearing color is never removed silently.
+
+Known inline Jira macros stay readable and editable without an opaque XML
+payload:
+
+```markdown
+Related issue: {{jira key="DOC-123"}}
+Matching issues: {{jira jqlQuery="project = DOC" count="true"}}
+```
+
+A paragraph containing only a table-of-contents macro uses the existing block
+directive form:
+
+```markdown
+::: toc maxLevel="3"
+:::
+```
+
+Confluence's structural `content-wrapper` div around table-cell content is
+transparent. Styled divs and nested tables remain unsupported in editable
+Markdown, so callers can block a lossy publish through `push_safe=False`.
 
 ## Why another converter?
 
@@ -58,24 +108,16 @@ both gaps:
 
 ## Install
 
-cfxmark ships in two modes:
+cfxmark is a converter library. Network transport and credentials remain the
+caller's responsibility:
 
 ```bash
 # Core: Markdown ↔ Confluence XHTML converter + Jira wiki renderer
 pip install cfxmark
 
-# With uv (recommended):
+# With uv (recommended)
 uv add cfxmark
-
-# With the optional Confluence REST client (zero additional deps —
-# the extra is namespace-only and reserves a stable upgrade slot):
-pip install 'cfxmark[confluence]'
 ```
-
-The `confluence` extra declares zero third-party runtime dependencies —
-`from cfxmark.confluence import ConfluenceClient` works even without it.
-The extra exists to signal intent in requirements files and to reserve a
-stable upgrade slot for future convenience helpers.
 
 cfxmark depends on `lxml` and `mistletoe`. Python 3.10+.
 
@@ -87,7 +129,7 @@ cfxmark grades every Confluence construct into one of three buckets:
 |---|---|---|
 | **I — Native** | Standard CommonMark / GFM (headings, lists, tables, code fences, links, images, blockquote, hr, inline emphasis) | Lossless round-trip after canonicalization. |
 | **II — Directive** | Confluence macros with a known Markdown directive mapping (`info`, `note`, `warning`, `tip`, `jira`, `expand`, `toc`) | Lossless after canonicalization. Pluggable via `MacroRegistry`. |
-| **III — Opaque** | Everything else | Captured byte-for-byte through cfxmark's opaque-block / inline-opaque mechanism. **Never dropped, never rewritten.** |
+| **III — Opaque** | Everything else | The legacy profile carries verified XML payloads through opaque-block / inline-opaque markers. Editable projections report unsupported content instead of claiming a universally lossless publish. |
 
 See [`docs/SPEC.md`](https://github.com/eunsanMountain/cfxmark/blob/main/docs/SPEC.md)
 for the full mapping table and
@@ -96,28 +138,66 @@ for the opaque-block format.
 
 ## Usage
 
-### Round-trip a Confluence page through Markdown
+### Edit a remote Confluence page with source-bound proof
 
 ```python
 import cfxmark
 
-# Whatever fetched the page (REST API call, exported XML file, …)
-xhtml = my_confluence_client.get_storage_format(page_id)
+# Use the same exact options for pull, candidate construction, and validation.
+options = cfxmark.ConversionOptions(profile="editable")
 
-# Convert to Markdown
-md_result = cfxmark.to_md(xhtml)
-markdown = md_result.markdown
+# Whatever fetched the page (REST API call, exported XML file, ...)
+xhtml_s0 = my_confluence_client.get_storage_format(page_id)
+
+# Convert once and write the managed projection. `markdown` remains the body
+# against which source ranges are measured; `managed_markdown` is the file.
+base = cfxmark.to_md_artifact(xhtml_s0, options=options)
+write_text("page.md", base.managed_markdown)
 
 # … user edits the Markdown …
+edited_m1 = read_text("page.md")
 
-# Convert back to Confluence storage XHTML
-cfx_result = cfxmark.to_cfx(markdown)
-my_confluence_client.update_page(page_id, cfx_result.xhtml)
+# Build C0 and C1 internally, then classify every S0 -> C1 leaf change.
+candidate = cfxmark.to_cfx_artifact(
+    edited_m1,
+    presentation=base.presentation,
+    base_artifact=base,
+    splice_source=xhtml_s0,
+    options=options,
+)
+
+# Re-fetch immediately before publication and reject stale or fatal proof.
+fresh_storage = my_confluence_client.get_storage_format(page_id)
+cfxmark.validate_managed_cfx_artifact(candidate, source_storage=fresh_storage, options=options)
+if not candidate.push_safe:
+    raise ValueError(candidate.migration_report)
+
+my_confluence_client.update_page(page_id, candidate.xhtml)
 
 # Optionally upload any newly referenced local images
-for filename in cfx_result.attachments:
+for filename in candidate.attachments:
     my_confluence_client.upload_attachment(page_id, filename)
 ```
+
+`to_md_artifact()` exposes a classified `migration_report`. Each atomic
+occurrence has a stable occurrence ID tied to the source storage hash. The
+managed projection places disclosure, summary, and occurrence comments near
+the affected content without shifting the ranges stored against `markdown`.
+
+When both `base_artifact` and `splice_source` are supplied,
+`to_cfx_artifact()` returns a managed candidate with an immutable ownership
+proof. It hashes S0/M0/C0/M1/C1, converter and profile; names the actual edit
+operation IDs and migration occurrence IDs; and records unclassified,
+multiply-owned, overlapping, or otherwise ambiguous changes. Every final
+storage leaf must have exactly one owner. Missing source maps, duplicate
+identity, ambiguous move correspondence, stale source, or fatal diagnostics
+make publication unsafe. Publish preflight rebuilds the semantic matcher and
+storage source-map claims from the candidate document, then verifies each
+intended leaf against the independently derived edit operation. It rejects a
+fatal proof regardless of the candidate's `push_safe` field. Merely appearing
+in a stage diff is not ownership. If two producer diagnostics reuse one
+occurrence ID for different source locations, both occurrences remain visible
+and the candidate fails closed instead of silently deduplicating them.
 
 ### Image assets
 
@@ -185,8 +265,8 @@ graph LR
 
 ### Inline opaque references
 
-Inline elements that have no native Markdown form — Confluence user
-mentions, inline Jira issue macros, custom widget invocations, … —
+Inline elements that have no native or directive Markdown form — Confluence
+user mentions, unsupported inline macros, custom widget invocations, … —
 become a short Markdown link with a `cfx:op-...` URL:
 
 ```markdown
@@ -296,16 +376,15 @@ c2 = cfxmark.canonicalize_cfx(round_tripped_xhtml)
 assert c1 == c2  # passes for any document in the supported subset
 ```
 
-`canonicalize_cfx` is the same function the test suite uses to
-verify byte-identical round trips against real Confluence pages.
-A good push pipeline calls it **before** the REST PUT so an unchanged
-body is skipped entirely:
+`canonicalize_cfx` is useful for equality and fixed-point checks. It is not a
+publish authorization boundary: remote edits must use a managed candidate and
+`validate_managed_cfx_artifact` against freshly fetched storage before PUT.
 
 ```python
-remote = cfxmark.canonicalize_cfx(my_client.get_page(page_id))
-local = cfxmark.canonicalize_cfx(cfxmark.to_cfx(local_md).xhtml)
-if remote != local:
-    my_client.update_page(page_id, ...)
+fresh_storage = my_client.get_storage_format(page_id)
+cfxmark.validate_managed_cfx_artifact(candidate, source_storage=fresh_storage, options=options)
+if candidate.push_safe:
+    my_client.update_page(page_id, candidate.xhtml)
 ```
 
 #### `normalize_md(markdown)` — converge hand-edited Markdown
@@ -378,89 +457,20 @@ result = cfxmark.to_jira_wiki(
 `result.jira_wiki` is `None` when `section=` is specified but not
 found in the document.
 
-## Confluence client (optional extra)
-
-Install with the `confluence` extra to signal intent — the client
-itself is always importable because it is built on Python's standard
-library:
-
-```bash
-pip install 'cfxmark[confluence]'
-```
-
-The extra declares **zero additional runtime dependencies**. It exists to:
-1. Signal the dependency in your `requirements.txt` / `pyproject.toml`
-   so readers see that you rely on the optional subsystem.
-2. Reserve a stable upgrade slot — if future convenience helpers
-   (credential stores, rich CLI) gain third-party deps, the extra is
-   the place they'll land.
-
-```python
-from cfxmark.confluence import ConfluenceClient, BearerTokenFile
-
-client = ConfluenceClient(
-    host="https://confluence.example.com",
-    auth=BearerTokenFile("~/.secrets/confluence_pat"),
-    dialect="server",
-)
-
-# Canonical-aware push — skips the REST PUT entirely when the remote
-# body is byte-equivalent to the rendered local Markdown.
-result = client.push_markdown(
-    page_id="12345",
-    md_text=my_markdown,
-    md_path="docs/my_page.md",
-    on_conflict="abort",
-)
-if result.changed:
-    print(f"Pushed. Uploaded {len(result.uploaded_attachments)} new attachments.")
-    if result.has_partial_failure:
-        for name, ex in result.failed_attachments:
-            print(f"  ! attachment {name} failed: {ex!r}")
-else:
-    print("No-op; remote is already current.")
-
-# Canonical-aware pull with resolved assets in a sidecar directory.
-pull = client.pull_markdown(
-    page_id="12345",
-    md_path="docs/my_page.md",
-    resolve_assets_mode="sidecar",
-    asset_dir="docs/my_page-assets",
-)
-```
-
-**Logging.** The client uses `logging.getLogger("cfxmark.confluence")`
-exclusively — no direct writes to `sys.stdout` or `sys.stderr`.
-Enable progress output with:
-
-```python
-import logging
-logging.getLogger("cfxmark").setLevel(logging.INFO)
-```
-
-**Confluence dialect.** The default is `dialect="server"` because
-Confluence Server / Data Center is the reference test target.
-Confluence Cloud users should pass `dialect="cloud"` — the
-`X-Atlassian-Token: no-check` XSRF bypass header (mandatory on
-Server, unsupported on Cloud) is gated on this setting. Cloud support
-is best-effort; if you hit a Cloud-only regression, please open an
-issue.
-
 ## Jira wiki (experimental, lossy)
 
-The Confluence round-trip (`to_cfx` / `to_md`) is **lossless** after
-canonicalization — every construct in the supported subset
-round-trips byte-for-byte, and everything else is preserved through
-the opaque-block mechanism. The Jira wiki direction is **not**. Jira
-wiki markup is a looser dialect without opaque-macro identity
-preservation, and several constructs have no equivalent on the
-Markdown side.
+The supported Confluence subset reaches a canonical fixed point. The legacy
+profile can additionally carry verified opaque payloads while their control
+markers remain intact. Editable and managed publishing instead exposes every
+known migration and requires a source-bound proof; it does not make a blanket
+lossless claim. The Jira wiki direction has no opaque-macro identity
+preservation, and several constructs have no equivalent on the Markdown side.
 
 Keep the two contracts at different import sites so the asymmetry is
 visible:
 
 ```python
-from cfxmark import to_cfx, to_md           # lossless, Confluence side
+from cfxmark import to_cfx, to_md           # canonical Confluence conversion
 from cfxmark.jira import from_jira_wiki, to_jira_wiki  # experimental
 ```
 
@@ -471,10 +481,10 @@ The strongest guarantee the Jira pipeline offers is:
 > `from_jira_wiki(jira_wiki)` produces a :class:`ConversionResult` whose
 > Markdown representation reaches a **fixed point** after at most two
 > `wiki → md → wiki` iterations. Pass 1 (`wiki → md`) is a one-way
-> canonicalization; pass 2 (`md → wiki → md`) must be idempotent. The
-> real-world fixture corpus (6 Jira issue descriptions drawn from
-> production) is exercised in `tests/unit/test_jira_wiki_parser.py`
-> to pin this contract.
+> canonicalization; pass 2 (`md → wiki → md`) must be idempotent. A
+> fixture corpus of 6 representative Jira issue descriptions is
+> exercised in `tests/unit/test_jira_wiki_parser.py` to pin this
+> contract.
 
 Explicitly **allowed** canonicalization (not considered a diff):
 
@@ -626,10 +636,6 @@ byte-identical. The top-level `to_jira_wiki`, `from_jira_wiki`, and
 `ConversionResult.jira_wiki` field ARE stable — only the quality
 of the round-trip itself is experimental. See the "Jira wiki
 (experimental, lossy)" section above for the full contract.
-
-**`cfxmark.confluence`** — `ConfluenceClient`, `PushResult`,
-`PullResult`, `Auth`, `BearerToken`, `BearerTokenFile`, `BasicAuth`,
-`EnvBearerToken`, `HTTPError`, `ConfluenceVersionConflict`.
 
 Guarantees:
 - Breaking changes bump the minor version for 0.x.y releases.

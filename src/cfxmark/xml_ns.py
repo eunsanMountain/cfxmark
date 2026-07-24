@@ -59,20 +59,69 @@ def ri_tag(name: str) -> str:
     return f"{{{RI_URI}}}{name}"
 
 
-def strip_ns(tag: str) -> str:
+def strip_ns(tag: object) -> str:
     """Return the local part of an element tag, discarding the namespace."""
 
+    if not isinstance(tag, str):
+        return ""
     if tag.startswith("{"):
         return tag.split("}", 1)[1]
     return tag
 
 
-def ns_of(tag: str) -> str | None:
+def ns_of(tag: object) -> str | None:
     """Return the namespace URI of an element tag, or ``None`` if bare."""
 
+    if not isinstance(tag, str):
+        return None
     if tag.startswith("{"):
         return tag[1:].split("}", 1)[0]
     return None
+
+
+def storage_qualified_name(name: str | bytes) -> str:
+    """Return the canonical name used in storage source-map identities."""
+
+    if isinstance(name, bytes):
+        name = name.decode("utf-8")
+    if name.startswith(f"{{{AC_URI}}}"):
+        return f"ac:{name.split('}', 1)[1]}"
+    if name.startswith(f"{{{RI_URI}}}"):
+        return f"ri:{name.split('}', 1)[1]}"
+    if name.startswith("{"):
+        namespace, local = name[1:].split("}", 1)
+        return f"{{{namespace}}}{local}"
+    return name
+
+
+def storage_node_name(element: ET._Element) -> str:
+    """Return the canonical source-map component name for an XML node."""
+
+    if isinstance(element.tag, str):
+        return storage_qualified_name(element.tag)
+    if element.tag is ET.Comment:
+        return "#comment"
+    if element.tag is ET.ProcessingInstruction:
+        return "#processing-instruction"
+    return "#node"
+
+
+def storage_semantic_path(root: ET._Element, element: ET._Element) -> tuple[str, ...]:
+    """Return the exact document-order path used by storage leaf extraction."""
+
+    components: list[str] = []
+    current = element
+    while current is not root:
+        parent = current.getparent()
+        if parent is None:
+            raise ValueError("storage element is not contained by the supplied fragment root")
+        name = storage_node_name(current)
+        ordinal = sum(1 for sibling in current.itersiblings(preceding=True) if storage_node_name(sibling) == name)
+        components.append(f"{name}[{ordinal}]")
+        current = parent
+    if not components:
+        raise ValueError("the synthetic storage fragment root has no semantic path")
+    return tuple(reversed(components))
 
 
 def build_structured_macro(
@@ -84,6 +133,14 @@ def build_structured_macro(
 
     Parameters are emitted in the order given. ``body`` is inserted as
     an ``<ac:rich-text-body>`` child if not ``None``.
+
+    Invariant: this always emits ``ac:schema-version="1"``. The exact remote
+    value (including its absence) is restored *after the fact* by the renderers
+    -- ``_render_code_block`` for code and ``_restore_macro_identity`` for
+    directive macros -- from the captured node identity. Do not make this
+    function conditionally omit the attribute: the code-block and directive edit
+    round-trips depend on the deterministic default being present here and
+    adjusted downstream.
     """
 
     macro = ET.Element(
@@ -111,9 +168,7 @@ def build_structured_macro(
 # ---------------------------------------------------------------------------
 
 
-DEFAULT_COLOR_STYLE_RE = re.compile(
-    r"^\s*color\s*:\s*var\(--ds-text[^)]*\)\s*;?\s*$"
-)
+DEFAULT_COLOR_STYLE_RE = re.compile(r"^\s*color\s*:\s*var\(\s*--ds-text\s*(?:,\s*#[0-9a-fA-F]{3,8})?\s*\)\s*;?\s*$")
 
 
 def collect_text_with_breaks(element: ET._Element) -> str:
@@ -151,6 +206,9 @@ __all__ = [
     "ri_tag",
     "strip_ns",
     "ns_of",
+    "storage_qualified_name",
+    "storage_node_name",
+    "storage_semantic_path",
     "build_structured_macro",
     "DEFAULT_COLOR_STYLE_RE",
     "collect_text_with_breaks",

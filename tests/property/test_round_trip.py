@@ -22,8 +22,11 @@ gap.
 
 from __future__ import annotations
 
+import html
+
 import hypothesis.strategies as st
-from hypothesis import HealthCheck, given, settings
+from hypothesis import HealthCheck, assume, given, settings
+from lxml import etree as ET
 
 import cfxmark
 
@@ -259,6 +262,29 @@ def test_round_trip_converges_after_one_pass_cjk(md_input: str) -> None:
     assert once == twice
 
 
+_adversarial_text = st.text(
+    alphabet=st.sampled_from(list("abcXYZ019 #+-~<>/&[]|\\.*_()")),
+    min_size=1,
+    max_size=40,
+)
+
+
+@settings(max_examples=150, deadline=None)
+@given(_adversarial_text)
+def test_editable_storage_text_is_preserved(text: str) -> None:
+    """Editable conversion must preserve text, not only converge after damage."""
+
+    assume(bool(text.strip()) and text == text.strip())
+    storage = f"<p>{html.escape(text)}</p>"
+    first = cfxmark.to_md(storage, options=cfxmark.ConversionOptions(profile="editable"))
+    assert first.push_safe is True
+    assert first.markdown is not None
+    rendered = cfxmark.to_cfx(first.markdown, options=cfxmark.ConversionOptions(profile="editable")).xhtml
+    assert rendered is not None
+    root = ET.fromstring(f"<root>{rendered}</root>")
+    assert "".join(root.itertext()) == text
+
+
 # ---------------------------------------------------------------------------
 # Jira wiki property tests (v0.2.0)
 # ---------------------------------------------------------------------------
@@ -344,6 +370,4 @@ def test_jira_wiki_heading_monotonicity(md_input: str) -> None:
     # Extract heading text labels from the Jira wiki output (in order).
     output_texts = [m.group(1).strip() for m in _HEADING_LINE_RE.finditer(result.jira_wiki)]
 
-    assert input_texts == output_texts, (
-        f"Heading order changed:\n  input:  {input_texts}\n  output: {output_texts}"
-    )
+    assert input_texts == output_texts, f"Heading order changed:\n  input:  {input_texts}\n  output: {output_texts}"

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Literal
 
 # ---------------------------------------------------------------------------
 # Base node
@@ -24,6 +25,8 @@ from enum import Enum
 @dataclass(frozen=True)
 class Node:
     """Abstract base for all AST nodes."""
+
+    source_path: tuple[str, ...] = field(default=(), kw_only=True, compare=False, repr=False)
 
 
 # ---------------------------------------------------------------------------
@@ -90,15 +93,20 @@ class Image(Node):
     """Image reference.
 
     ``src`` is either an absolute URL (rendered as ``<ri:url>``) or a
-    local file reference (rendered as ``<ri:attachment>``). The library
-    does not upload attachments — the caller owns that.
+    local file reference (rendered as ``<ri:attachment>``). A typed
+    ``attachment_filename`` preserves a source attachment's flat Confluence
+    identity without interpreting filename punctuation as URL syntax. The
+    library does not upload attachments — the caller owns that.
     """
 
     src: str
+    attachment_filename: str | None = None
     alt: str = ""
     title: str | None = None
     width: int | None = None
     height: int | None = None
+    thumbnail: bool = False
+    align: str | None = None
 
 
 @dataclass(frozen=True)
@@ -128,6 +136,15 @@ class ColorSpan(Node):
 
     color: str
     children: tuple[InlineNode, ...] = field(default_factory=tuple)
+    background: bool = False
+
+
+@dataclass(frozen=True)
+class AlignedSpan(Node):
+    """Inline segment with paragraph-level center or right alignment."""
+
+    align: str
+    children: tuple[InlineNode, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -138,12 +155,35 @@ class Citation(Node):
 
 
 @dataclass(frozen=True)
+class InlineDirectiveMacro(Node):
+    """A known Confluence macro represented in inline Markdown."""
+
+    name: str
+    parameters: tuple[tuple[str, str], ...] = field(default_factory=tuple)
+    # Remote identity that the inline Markdown projection cannot carry. A
+    # freshly authored macro keeps ``schema_version == "1"``; a macro parsed
+    # from remote storage records the exact source values (``None`` when the
+    # source omitted ``ac:schema-version``) so regeneration matches byte for
+    # byte and its body/parameters stay editable.
+    macro_id: str | None = None
+    macro_schema_version: str | None = "1"
+
+
+@dataclass(frozen=True)
+class UnsupportedMarker(Node):
+    """Local marker for Confluence content omitted from editable Markdown."""
+
+    kind: str
+    macro: str | None = None
+    occurrence_id: str | None = None
+
+
+@dataclass(frozen=True)
 class InlineOpaque(Node):
     """A Confluence fragment preserved verbatim in inline position.
 
-    Used for things like inline ``<ac:link>`` user mentions or inline
-    ``<ac:structured-macro>`` references that have no Markdown
-    equivalent. The Markdown renderer emits a short
+    Used for things like inline ``<ac:link>`` user mentions or unsupported
+    inline ``<ac:structured-macro>`` references. The Markdown renderer emits a short
     ``[label](cfx:op-<hash>)`` link and stores the XML payload in the
     ``cfxmark:payloads`` sidecar section at the bottom of the
     document; the parser reverses both halves and reconstructs this
@@ -170,10 +210,13 @@ InlineNode = (
     | Superscript
     | Underline
     | ColorSpan
+    | AlignedSpan
     | Citation
     | InlineCode
     | Link
     | Image
+    | InlineDirectiveMacro
+    | UnsupportedMarker
     | InlineOpaque
 )
 
@@ -196,6 +239,7 @@ class Paragraph(Node):
     """A block of inline content."""
 
     children: tuple[InlineNode, ...] = field(default_factory=tuple)
+    align: str | None = None
 
 
 @dataclass(frozen=True)
@@ -208,6 +252,8 @@ class CodeBlock(Node):
 
     content: str
     language: str | None = None
+    macro_id: str | None = None
+    macro_schema_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -261,6 +307,29 @@ class CellAlign(Enum):
     NONE = "none"
 
 
+ColorSourceEncoding = Literal["data-highlight-colour", "css-background-color", "bgcolor"]
+ColorValueKind = Literal["named", "hex", "rgb", "rgba", "design-token"]
+RenderStrategy = Literal["highlight-attribute", "style-background-color"]
+
+
+@dataclass(frozen=True)
+class CellBackground:
+    """Validated table-cell background presentation.
+
+    Parsing a value and proving that a Confluence server can render it are
+    deliberately separate.  ``capability_id`` and ``render_strategy`` stay
+    ``None`` until a versioned server read-back capability proves the pair.
+    """
+
+    exact: str
+    equality_key: str
+    source_encoding: ColorSourceEncoding
+    value_kind: ColorValueKind
+    semantic: str | None = None
+    capability_id: str | None = None
+    render_strategy: RenderStrategy | None = None
+
+
 @dataclass(frozen=True)
 class TableCell(Node):
     """A single table cell.
@@ -275,8 +344,10 @@ class TableCell(Node):
     kind: CellType
     children: tuple[InlineNode, ...] = field(default_factory=tuple)
     align: CellAlign = CellAlign.NONE
+    source_style: str | None = None
     colspan: int = 1
     rowspan: int = 1
+    background: CellBackground | None = None
 
 
 @dataclass(frozen=True)
@@ -308,6 +379,13 @@ class DirectiveMacro(Node):
     name: str
     parameters: tuple[tuple[str, str], ...] = field(default_factory=tuple)
     body: tuple[BlockNode, ...] | None = None
+    # Remote identity the Markdown projection cannot carry. A freshly authored
+    # ``::: expand`` keeps ``schema_version == "1"``; a macro parsed from remote
+    # storage records the exact source values (``None`` when the source omitted
+    # ``ac:schema-version``) so regeneration matches byte for byte and the body
+    # and parameters stay editable rather than becoming a preserve-only island.
+    macro_id: str | None = None
+    macro_schema_version: str | None = "1"
 
 
 @dataclass(frozen=True)
@@ -358,6 +436,7 @@ BlockNode = (
     | HorizontalRule
     | Table
     | DirectiveMacro
+    | UnsupportedMarker
     | OpaqueBlock
     | PassthroughComment
 )
@@ -398,6 +477,8 @@ __all__ = [
     "InlineCode",
     "Link",
     "Image",
+    "InlineDirectiveMacro",
+    "UnsupportedMarker",
     "InlineOpaque",
     "InlineNode",
     "Heading",
@@ -410,6 +491,10 @@ __all__ = [
     "HorizontalRule",
     "CellType",
     "CellAlign",
+    "CellBackground",
+    "ColorSourceEncoding",
+    "ColorValueKind",
+    "RenderStrategy",
     "TableCell",
     "TableRow",
     "Table",

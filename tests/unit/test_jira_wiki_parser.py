@@ -94,9 +94,7 @@ def test_heading_empty_content() -> None:
     as a visual divider in real issue bodies) must not crash."""
     doc = parse("h2. \nbody")
     # Empty heading has level=2, children=empty. Followed by paragraph.
-    assert any(
-        isinstance(b, Heading) and b.level == 2 for b in doc.children
-    )
+    assert any(isinstance(b, Heading) and b.level == 2 for b in doc.children)
 
 
 # ---------------------------------------------------------------------------
@@ -142,9 +140,7 @@ def test_tilde_inside_word_is_plain_text() -> None:
     assert isinstance(block, Paragraph)
     # The run should collapse to a single Text node with the literal
     # characters preserved.
-    text = "".join(
-        n.content for n in block.children if isinstance(n, Text)
-    )
+    text = "".join(n.content for n in block.children if isinstance(n, Text))
     assert "v1.0~v2.0" in text
 
 
@@ -153,9 +149,7 @@ def test_unclosed_tilde_is_plain_text() -> None:
     ``~`` on the same line must stay as plain text."""
     block = only_block("~next week: first milestone")
     assert isinstance(block, Paragraph)
-    text = "".join(
-        n.content for n in block.children if isinstance(n, Text)
-    )
+    text = "".join(n.content for n in block.children if isinstance(n, Text))
     assert text.startswith("~next week")
 
 
@@ -179,9 +173,7 @@ def test_bold_inside_word_is_plain_text() -> None:
     boundary check (previous char is alphanumeric)."""
     block = only_block("2*3*4")
     assert isinstance(block, Paragraph)
-    text = "".join(
-        n.content for n in block.children if isinstance(n, Text)
-    )
+    text = "".join(n.content for n in block.children if isinstance(n, Text))
     assert text == "2*3*4"
     assert not any(isinstance(n, Strong) for n in block.children)
 
@@ -189,11 +181,7 @@ def test_bold_inside_word_is_plain_text() -> None:
 def test_asterisk_at_word_boundary_is_bold() -> None:
     block = only_block("word *bold* word")
     assert isinstance(block, Paragraph)
-    assert any(
-        isinstance(n, Strong)
-        and n.children == (Text(content="bold"),)
-        for n in block.children
-    )
+    assert any(isinstance(n, Strong) and n.children == (Text(content="bold"),) for n in block.children)
 
 
 def test_emphasis_content_must_not_start_with_whitespace() -> None:
@@ -226,9 +214,7 @@ def test_emphasis_content_must_not_start_with_whitespace() -> None:
 def test_escape_produces_literal(escaped: str, expected: str) -> None:
     block = only_block(f"before {escaped} after")
     assert isinstance(block, Paragraph)
-    text = "".join(
-        n.content for n in block.children if isinstance(n, Text)
-    )
+    text = "".join(n.content for n in block.children if isinstance(n, Text))
     assert expected in text
 
 
@@ -271,17 +257,13 @@ def test_link_label_with_nested_brackets() -> None:
     contains a literal ``[...]`` that MUST NOT be re-interpreted as
     another link. Parsing labels with ``allow_link=False`` guarantees
     this."""
-    block = only_block(
-        "[EXAMPLE-100 [draft] extended mode spec|https://example.com/browse/EXAMPLE-100]"
-    )
+    block = only_block("[EXAMPLE-100 [draft] extended mode spec|https://example.com/browse/EXAMPLE-100]")
     (link,) = block.children
     assert isinstance(link, Link)
     assert link.url == "https://example.com/browse/EXAMPLE-100"
     # The nested brackets must appear as literal text nodes inside the
     # label — not as a Link child.
-    label_text = "".join(
-        n.content for n in link.children if isinstance(n, Text)
-    )
+    label_text = "".join(n.content for n in link.children if isinstance(n, Text))
     assert "[draft]" in label_text
     assert not any(isinstance(n, Link) for n in link.children)
 
@@ -357,9 +339,7 @@ def test_image_must_have_extension() -> None:
 def test_color_macro_produces_colorspan_node() -> None:
     from cfxmark.ast import ColorSpan
 
-    document, warnings, _ = parse_full(
-        "Some {color:#de350b}red text{color} here"
-    )
+    document, warnings, _ = parse_full("Some {color:#de350b}red text{color} here")
     para = document.children[0]
     assert isinstance(para, Paragraph)
     colors = [n for n in para.children if isinstance(n, ColorSpan)]
@@ -469,9 +449,7 @@ def test_table_multi_line_cell() -> None:
     row = block.body[0]
     assert len(row.cells) == 2
     # First cell contains the newline + ``(OR)``.
-    cell_text = "".join(
-        n.content for n in row.cells[0].children if isinstance(n, Text)
-    )
+    cell_text = "".join(n.content for n in row.cells[0].children if isinstance(n, Text))
     assert "Mode Alpha" in cell_text
     assert "(OR)" in cell_text
 
@@ -496,9 +474,7 @@ def test_table_escaped_pipe_in_cell() -> None:
     assert isinstance(block, Table)
     row = block.body[0]
     assert len(row.cells) == 2
-    cell_text = "".join(
-        n.content for n in row.cells[0].children if isinstance(n, Text)
-    )
+    cell_text = "".join(n.content for n in row.cells[0].children if isinstance(n, Text))
     assert "||" in cell_text
 
 
@@ -562,9 +538,7 @@ def test_info_admonition() -> None:
 def test_panel_mapped_to_note_with_warning() -> None:
     """D4: ``{panel}`` has no native cfxmark admonition, so it is
     mapped to ``{note}`` with a lossy warning."""
-    document, warnings, _ = parse_full(
-        "{panel:title=Summary}\nbody\n{panel}"
-    )
+    document, warnings, _ = parse_full("{panel:title=Summary}\nbody\n{panel}")
     block = document.children[0]
     assert isinstance(block, DirectiveMacro)
     assert block.name == "note"
@@ -660,13 +634,9 @@ def test_fixture_round_trip_reaches_fixed_point(fixture: Path) -> None:
 
     source = fixture.read_text()
     md1 = from_jira_wiki(source).markdown
-    wiki2 = to_jira_wiki(
-        md1, input_format="markdown", heading_promotion="jira"
-    ).jira_wiki
+    wiki2 = to_jira_wiki(md1, input_format="markdown", heading_promotion="jira").jira_wiki
     md3 = from_jira_wiki(wiki2).markdown
-    wiki4 = to_jira_wiki(
-        md3, input_format="markdown", heading_promotion="jira"
-    ).jira_wiki
+    wiki4 = to_jira_wiki(md3, input_format="markdown", heading_promotion="jira").jira_wiki
     md5 = from_jira_wiki(wiki4).markdown
     assert md3 == md5, (
         f"{fixture.name}: Markdown canonical form is not stable at the "
@@ -674,8 +644,7 @@ def test_fixture_round_trip_reaches_fixed_point(fixture: Path) -> None:
         f"idempotent for this input."
     )
     assert wiki2 == wiki4, (
-        f"{fixture.name}: Jira wiki canonical form is not stable at the "
-        f"second pass (wiki2 != wiki4)."
+        f"{fixture.name}: Jira wiki canonical form is not stable at the second pass (wiki2 != wiki4)."
     )
 
 

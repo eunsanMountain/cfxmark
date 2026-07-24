@@ -126,15 +126,7 @@ def test_directive_inside_code_fence_is_not_extracted() -> None:
     """A literal ``::: info`` example inside a fenced code block must
     not be rewritten into a real directive placeholder."""
 
-    md = (
-        "Description of the directive syntax:\n\n"
-        "```text\n"
-        "::: info\n"
-        "hello\n"
-        ":::\n"
-        "```\n\n"
-        "End.\n"
-    )
+    md = "Description of the directive syntax:\n\n```text\n::: info\nhello\n:::\n```\n\nEnd.\n"
     xhtml = cfxmark.to_cfx(md).xhtml
     # The CFX output must contain the literal example text inside a
     # code macro, NOT a CFXMARK placeholder leak or a real info panel.
@@ -156,11 +148,7 @@ def test_link_title_with_double_quote_round_trips() -> None:
 
 
 def test_image_title_with_double_quote_round_trips() -> None:
-    cfx = (
-        '<p><ac:image ac:title=\'a "quote" here\'>'
-        '<ri:url ri:value="https://e.test/img.png"/>'
-        "</ac:image></p>"
-    )
+    cfx = '<p><ac:image ac:title=\'a "quote" here\'><ri:url ri:value="https://e.test/img.png"/></ac:image></p>'
     md = cfxmark.to_md(cfx).markdown
     assert '\\"quote\\"' in md
     back = cfxmark.to_cfx(md).xhtml
@@ -214,10 +202,7 @@ def test_tampered_opaque_body_falls_back_to_text() -> None:
     XML — it round-trips as a plain code fence so the body becomes
     inert text inside CDATA."""
 
-    cfx = (
-        '<ac:structured-macro ac:name="custom" ac:macro-id="x-y-z">'
-        "</ac:structured-macro>"
-    )
+    cfx = '<ac:structured-macro ac:name="custom" ac:macro-id="x-y-z"></ac:structured-macro>'
     md = cfxmark.to_md(cfx).markdown
     tampered = md.replace('ac:name="custom"', 'ac:name="evil"')
     back = cfxmark.to_cfx(tampered).xhtml

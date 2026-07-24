@@ -43,18 +43,12 @@ def test_round_trip_canonical(path: Path) -> None:
     if canonical_orig != canonical_back:
         # Compute first diff position for easy debugging.
         diff_at = next(
-            (
-                i
-                for i, (a, b) in enumerate(zip(canonical_orig, canonical_back))
-                if a != b
-            ),
+            (i for i, (a, b) in enumerate(zip(canonical_orig, canonical_back)) if a != b),
             min(len(canonical_orig), len(canonical_back)),
         )
         ctx = 80
         before_orig = canonical_orig[max(0, diff_at - 30) : diff_at + ctx]
         before_back = canonical_back[max(0, diff_at - 30) : diff_at + ctx]
         pytest.fail(
-            f"{path.name}: round-trip differs at byte {diff_at}\n"
-            f"  orig: {before_orig!r}\n"
-            f"  back: {before_back!r}"
+            f"{path.name}: round-trip differs at byte {diff_at}\n  orig: {before_orig!r}\n  back: {before_back!r}"
         )

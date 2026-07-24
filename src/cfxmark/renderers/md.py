@@ -11,7 +11,7 @@ construct:
 * Code fences use triple backticks with a blank line before and after.
 * Tables use GFM pipe syntax with a ``---`` alignment row.
 * Headings use ATX (``#``, ``##``, …).
-* Hard breaks use trailing ``  `` (two spaces).
+* Hard breaks use the explicit ``<br>`` spelling.
 * Opaque blocks are emitted as documented in :mod:`cfxmark.opaque`.
 
 Because the output is canonical, ``to_md(to_cfx(m))`` converges after
@@ -22,10 +22,13 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Literal
 
 from cfxmark.ast import (
+    AlignedSpan,
     BlockNode,
     BlockQuote,
+    CellAlign,
     Citation,
     CodeBlock,
     ColorSpan,
@@ -37,6 +40,7 @@ from cfxmark.ast import (
     HorizontalRule,
     Image,
     InlineCode,
+    InlineDirectiveMacro,
     InlineNode,
     InlineOpaque,
     Link,
@@ -56,14 +60,24 @@ from cfxmark.ast import (
     TableRow,
     Text,
     Underline,
+    UnsupportedMarker,
 )
+from cfxmark.colors import coarse_color
+from cfxmark.exceptions import ConversionError
+from cfxmark.image_metadata import render_link_destination, serialize_image_metadata
 from cfxmark.opaque import (
     HEADER_NOTICE,
+    has_round_trippable_inline_payload,
+    is_round_trippable_inline_atomic,
+    is_round_trippable_table_wrapper,
     serialize_asset_marker,
     serialize_inline_opaque,
+    serialize_managed_inline_opaque,
     serialize_opaque,
     serialize_payloads,
 )
+from cfxmark.protected import protected_projection
+from cfxmark.table_grid import TableGridError, bounded_table_grid_layout
 
 # ---------------------------------------------------------------------------
 # Rendering options
@@ -81,6 +95,8 @@ class MarkdownRenderOptions:
 
     bullet_marker: str = "-"
     code_fence: str = "```"
+    profile: Literal["legacy", "editable", "readable"] = "legacy"
+    protected_projections: bool = False
 
 
 DEFAULT_OPTIONS = MarkdownRenderOptions()
@@ -109,7 +125,7 @@ def _escape_text(text: str) -> str:
     for ch in text:
         if ch == "\\":
             out.append("\\\\")
-        elif ch in "`*_[]|":
+        elif ch in "`*_[]|<>&~":
             out.append("\\" + ch)
         else:
             out.append(ch)
@@ -121,13 +137,53 @@ def _render_inline_text(
     *,
     prev_char: str = "",
     next_char: str = "",
+    opts: MarkdownRenderOptions = DEFAULT_OPTIONS,
+    table_cell: bool = False,
 ) -> str:
+    nodes = _coalesce_adjacent_styles(nodes)
     parts: list[str] = []
     for i, node in enumerate(nodes):
         prev = _last_char_of(parts) or prev_char
         nxt = _first_char_of_node(nodes[i + 1]) if i + 1 < len(nodes) else next_char
-        parts.append(_render_inline_node(node, prev_char=prev, next_char=nxt))
+        parts.append(
+            _render_inline_node(
+                node,
+                prev_char=prev,
+                next_char=nxt,
+                opts=opts,
+                table_cell=table_cell,
+            )
+        )
     return "".join(parts)
+
+
+def _coalesce_adjacent_styles(
+    nodes: tuple[InlineNode, ...],
+) -> tuple[InlineNode, ...]:
+    """Merge adjacent identical inline styles into one canonical run."""
+
+    merged: list[InlineNode] = []
+    for node in nodes:
+        if isinstance(node, Strong) and not node.children:
+            continue
+        if isinstance(node, Strong) and merged and isinstance(merged[-1], Strong):
+            previous = merged[-1]
+            assert isinstance(previous, Strong)
+            merged[-1] = Strong(children=previous.children + node.children)
+        elif isinstance(node, ColorSpan) and merged and isinstance(merged[-1], ColorSpan):
+            previous_color = merged[-1]
+            assert isinstance(previous_color, ColorSpan)
+            if previous_color.color == node.color and previous_color.background == node.background:
+                merged[-1] = ColorSpan(
+                    color=previous_color.color,
+                    children=previous_color.children + node.children,
+                    background=previous_color.background,
+                )
+            else:
+                merged.append(node)
+        else:
+            merged.append(node)
+    return tuple(merged)
 
 
 def _last_char_of(parts: list[str]) -> str:
@@ -204,56 +260,157 @@ def _render_inline_node(
     *,
     prev_char: str = "",
     next_char: str = "",
+    opts: MarkdownRenderOptions = DEFAULT_OPTIONS,
+    table_cell: bool = False,
 ) -> str:
     if isinstance(node, Text):
         return _escape_text(node.content)
     if isinstance(node, SoftBreak):
         return "\n"
     if isinstance(node, HardBreak):
-        return "  \n"
+        return "<br>"
     if isinstance(node, Emphasis):
-        inner = _render_inline_text(node.children)
-        if _needs_html_fallback(inner, prev_char, next_char):
-            return f"<em>{inner}</em>"
-        return "*" + inner + "*"
+        inner = _render_inline_text(node.children, opts=opts, table_cell=table_cell)
+        leading, core, trailing = _split_boundary_whitespace(inner)
+        if not core:
+            return inner
+        if _needs_html_fallback(
+            core,
+            leading[-1:] or prev_char,
+            trailing[:1] or next_char,
+        ):
+            return f"{leading}<em>{core}</em>{trailing}"
+        return f"{leading}*{core}*{trailing}"
     if isinstance(node, Strong):
-        inner = _render_inline_text(node.children)
-        if _needs_html_fallback(inner, prev_char, next_char):
-            return f"<strong>{inner}</strong>"
-        return "**" + inner + "**"
+        children = _flatten_redundant_strong(node.children)
+        inner = _render_inline_text(children, opts=opts, table_cell=table_cell)
+        leading, core, trailing = _split_boundary_whitespace(inner)
+        if not core:
+            return inner
+        if _needs_html_fallback(
+            core,
+            leading[-1:] or prev_char,
+            trailing[:1] or next_char,
+        ):
+            return f"{leading}<strong>{core}</strong>{trailing}"
+        return f"{leading}**{core}**{trailing}"
     if isinstance(node, Strikethrough):
-        inner = _render_inline_text(node.children)
-        if _needs_html_fallback(inner, prev_char, next_char):
-            return f"<del>{inner}</del>"
-        return "~~" + inner + "~~"
+        inner = _render_inline_text(node.children, opts=opts, table_cell=table_cell)
+        leading, core, trailing = _split_boundary_whitespace(inner)
+        if not core:
+            return inner
+        if _needs_html_fallback(
+            core,
+            leading[-1:] or prev_char,
+            trailing[:1] or next_char,
+        ):
+            return f"{leading}<del>{core}</del>{trailing}"
+        return f"{leading}~~{core}~~{trailing}"
     if isinstance(node, Subscript):
-        return f"<sub>{_render_inline_text(node.children)}</sub>"
+        return f"<sub>{_render_inline_text(node.children, opts=opts, table_cell=table_cell)}</sub>"
     if isinstance(node, Superscript):
-        return f"<sup>{_render_inline_text(node.children)}</sup>"
+        return f"<sup>{_render_inline_text(node.children, opts=opts, table_cell=table_cell)}</sup>"
     if isinstance(node, Underline):
-        return f"<ins>{_render_inline_text(node.children)}</ins>"
+        inner = _render_inline_text(node.children, opts=opts, table_cell=table_cell)
+        return inner if opts.profile == "readable" else f"<ins>{inner}</ins>"
     if isinstance(node, ColorSpan):
-        inner = _render_inline_text(node.children)
-        return f'<span style="color:{node.color}">{inner}</span>'
+        inner = _render_inline_text(node.children, opts=opts, table_cell=table_cell)
+        if opts.profile == "readable":
+            return inner
+        if opts.profile == "editable":
+            color = coarse_color(node.color)
+            if color is None:
+                color = node.color
+            if color == "neutral" and not node.background:
+                return inner
+            tag = "mark" if node.background else "span"
+            return f'<{tag} data-cfx-color="{_escape_attr(color)}">{inner}</{tag}>'
+        css_property = "background-color" if node.background else "color"
+        return f'<span style="{css_property}:{node.color}">{inner}</span>'
+    if isinstance(node, AlignedSpan):
+        inner = _render_inline_text(node.children, opts=opts, table_cell=table_cell)
+        if opts.profile == "readable":
+            return inner
+        return f"{inner}<!-- cfxmark:align={node.align} -->"
     if isinstance(node, Citation):
-        return f"<cite>{_render_inline_text(node.children)}</cite>"
+        return f"<cite>{_render_inline_text(node.children, opts=opts, table_cell=table_cell)}</cite>"
     if isinstance(node, InlineCode):
-        return _render_inline_code(node.content)
+        return _render_inline_code(node.content, escape_pipes=table_cell)
     if isinstance(node, Link):
-        label = _render_inline_text(node.children) or node.url
+        label = _render_inline_text(node.children, opts=opts, table_cell=table_cell)
+        if not label and opts.profile != "editable":
+            label = _escape_text(node.url)
+        destination = _render_link_destination(node.url)
         if node.title:
-            return f'[{label}]({node.url} "{_escape_md_title(node.title)}")'
-        return f"[{label}]({node.url})"
+            return f'[{label}]({destination} "{_escape_md_title(node.title)}")'
+        return f"[{label}]({destination})"
     if isinstance(node, Image):
-        return _render_inline_image(node)
+        return _render_inline_image(node, opts)
+    if isinstance(node, InlineDirectiveMacro):
+        params = " ".join(f'{key}="{_escape_attr(value)}"' for key, value in node.parameters)
+        suffix = f" {params}" if params else ""
+        return f"{{{{{node.name}{suffix}}}}}"
+    if isinstance(node, UnsupportedMarker):
+        return _render_unsupported_marker(node)
     if isinstance(node, InlineOpaque):
+        if opts.profile == "readable":
+            return f"[{_escape_text(node.label)}]"
+        if opts.profile == "editable" and (
+            is_round_trippable_inline_atomic(node.raw_xml)
+            or is_round_trippable_table_wrapper(node.raw_xml, node.source_path)
+        ):
+            return serialize_managed_inline_opaque(node.label, node.opaque_id)
+        if opts.profile == "editable" and opts.protected_projections:
+            return protected_projection(node)
+        if opts.profile == "editable":
+            marker = UnsupportedMarker(kind="inline", macro=_opaque_macro_name(node.raw_xml))
+            return f"\\[{_escape_text(node.label)}\\]{_render_unsupported_marker(marker)}"
         return serialize_inline_opaque(node.label, node.opaque_id)
     raise TypeError(f"unexpected inline node: {type(node).__name__}")
 
 
-def _render_inline_code(content: str) -> str:
+def _split_boundary_whitespace(text: str) -> tuple[str, str, str]:
+    """Move delimiter-adjacent whitespace outside inline markup."""
+
+    match = re.match(r"^(\s*)(.*?)(\s*)$", text, re.DOTALL)
+    if match is None:
+        return "", text, ""
+    return match.group(1), match.group(2), match.group(3)
+
+
+def _flatten_redundant_strong(
+    nodes: tuple[InlineNode, ...],
+) -> tuple[InlineNode, ...]:
+    """Remove nested strong nodes while an outer strong is active."""
+
+    flattened: list[InlineNode] = []
+    for node in nodes:
+        if isinstance(node, Strong):
+            flattened.extend(_flatten_redundant_strong(node.children))
+        else:
+            flattened.append(node)
+    return tuple(flattened)
+
+
+def _protect_boundary_nbsp(text: str) -> str:
+    """Encode boundary NBSP so CommonMark parsers cannot trim it."""
+
+    match = re.match(r"^(\u00a0*)(.*?)(\u00a0*)$", text, re.DOTALL)
+    if match is None:
+        return text
+    return "&nbsp;" * len(match.group(1)) + match.group(2) + "&nbsp;" * len(match.group(3))
+
+
+def _render_inline_code(content: str, *, escape_pipes: bool = False) -> str:
+    if escape_pipes:
+        content = re.sub(
+            r"(\\*)\|",
+            lambda match: ("\\" if not match.group(1) else match.group(1) * 2) + "|",
+            content,
+        )
     if "`" not in content:
-        return f"`{content}`"
+        padded = f" {content} " if content.strip() and (content[:1].isspace() or content[-1:].isspace()) else content
+        return f"`{padded}`"
     # Pick a backtick run longer than any run inside the content.
     longest = 0
     current = 0
@@ -265,26 +422,32 @@ def _render_inline_code(content: str) -> str:
             current = 0
     fence = "`" * (longest + 1)
     padded = content
-    if padded.startswith("`"):
-        padded = " " + padded
-    if padded.endswith("`"):
-        padded = padded + " "
+    if padded.strip() and (padded.startswith(("`", " ")) or padded.endswith(("`", " "))):
+        padded = f" {padded} "
     return f"{fence}{padded}{fence}"
 
 
-def _render_inline_image(node: Image) -> str:
-    alt = node.alt.replace("]", "\\]")
-    url = _encode_image_url(node)
+def _render_inline_image(node: Image, opts: MarkdownRenderOptions) -> str:
+    alt = _escape_text(node.alt)
+    destination = _render_link_destination(node.src)
     if node.title:
-        link = f'![{alt}]({url} "{_escape_md_title(node.title)}")'
+        link = f'![{alt}]({destination} "{_escape_md_title(node.title)}")'
     else:
-        link = f"![{alt}]({url})"
-    # Local attachments (non-absolute URLs) carry an asset marker so
+        link = f"![{alt}]({destination})"
+    if opts.profile != "readable":
+        link += serialize_image_metadata(
+            width=node.width,
+            height=node.height,
+            thumbnail=node.thumbnail,
+            align=node.align,
+        )
+    # Local attachments (non-absolute URLs) carry an asset marker after
+    # the image metadata marker so
     # ``cfxmark.resolve_assets`` can fetch and either embed or
     # sidecar them later. External URLs need no marker — they are
     # already resolvable.
-    if _is_local_attachment(node.src):
-        link += serialize_asset_marker(node.src)
+    if opts.profile != "readable" and (node.attachment_filename is not None or _is_local_attachment(node.src)):
+        link += serialize_asset_marker(node.attachment_filename or node.src)
     return link
 
 
@@ -298,6 +461,10 @@ def _is_local_attachment(src: str) -> bool:
     if src.startswith("data:"):
         return False
     return not bool(_ABSOLUTE_URL_RE.match(src))
+
+
+def _is_absolute_url(src: str) -> bool:
+    return bool(_ABSOLUTE_URL_RE.match(src))
 
 
 _ABSOLUTE_URL_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
@@ -315,27 +482,42 @@ def _escape_md_title(title: str) -> str:
     return title.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _encode_image_url(node: Image) -> str:
-    """Encode image width/height into the URL fragment when needed.
+def _render_link_destination(url: str) -> str:
+    return render_link_destination(url)
 
-    Standard Markdown has no syntax for image dimensions, so we piggy
-    back on the URL fragment using a ``#cfxmark:w=<N>,h=<N>`` tail.
-    The fragment is ignored by markdown renderers but parsed back by
-    :func:`~cfxmark.parsers.md.parse_md`, which preserves the round
-    trip through Confluence.
-    """
 
-    if node.width is None and node.height is None:
-        return node.src
-    parts: list[str] = []
-    if node.width is not None:
-        parts.append(f"w={node.width}")
-    if node.height is not None:
-        parts.append(f"h={node.height}")
-    fragment = "cfxmark:" + ",".join(parts)
-    if "#" in node.src:
-        return f"{node.src}&{fragment}"
-    return f"{node.src}#{fragment}"
+_PARAGRAPH_PREFIX_RE = re.compile(r"^(?P<indent> {0,3})(?P<marker>#{1,6}|[+\->)]|\d{1,9}[.)])(?=\s|$)")
+
+
+def _escape_paragraph_start(text: str) -> str:
+    """Prevent paragraph content from being reparsed as another block type."""
+
+    if text.startswith("\t"):
+        return "&#9;" + text[1:]
+    if text.startswith("    "):
+        return "&#32;" + text[1:]
+    if re.match(r"^ {0,3}\.(?:\s|$)", text):
+        dot = text.index(".")
+        return text[:dot] + "\\" + text[dot:]
+    match = _PARAGRAPH_PREFIX_RE.match(text)
+    if match is None:
+        if re.fullmatch(r" {0,3}={3,}\s*", text):
+            marker_index = text.index("=")
+            return text[:marker_index] + "\\" + text[marker_index:]
+        if re.fullmatch(r" {0,3}-{3,}\s*", text):
+            marker_index = text.index("-")
+            return text[:marker_index] + "\\" + text[marker_index:]
+        return text
+    marker = match.group("marker")
+    marker_start = match.start("marker")
+    escape_at = marker_start + len(marker) - 1 if marker[0].isdigit() else marker_start
+    return text[:escape_at] + "\\" + text[escape_at:]
+
+
+def _escape_paragraph_lines(text: str) -> str:
+    """Protect every line after a soft break from becoming a new block."""
+
+    return "\n".join(_escape_paragraph_start(line) for line in text.split("\n"))
 
 
 # ---------------------------------------------------------------------------
@@ -346,9 +528,15 @@ def _encode_image_url(node: Image) -> str:
 def _render_block(block: BlockNode, opts: MarkdownRenderOptions) -> str:
     if isinstance(block, Heading):
         level = max(1, min(6, block.level))
-        return "#" * level + " " + _render_inline_text(block.children).strip()
+        body = _render_inline_text(block.children, opts=opts).strip(" \t\r\n")
+        return "#" * level + " " + _protect_boundary_nbsp(body)
     if isinstance(block, Paragraph):
-        return _render_inline_text(block.children).strip("\n")
+        body = _render_inline_text(block.children, opts=opts).strip("\n")
+        body = _protect_boundary_nbsp(body)
+        body = _escape_paragraph_lines(body)
+        if block.align in {"left", "center", "right"} and opts.profile != "readable":
+            body += f"{{cfxalign={block.align}}}" if block.align == "left" else f"<!-- cfxmark:align={block.align} -->"
+        return body
     if isinstance(block, CodeBlock):
         language = block.language or ""
         fence = opts.code_fence
@@ -356,7 +544,6 @@ def _render_block(block: BlockNode, opts: MarkdownRenderOptions) -> str:
         # Ensure the content does not contain the fence sequence.
         if fence in body:
             fence = "`" * (body.count("`") + 3)
-        body = body.rstrip("\n")
         return f"{fence}{language}\n{body}\n{fence}"
     if isinstance(block, BlockQuote):
         inner = _render_blocks(block.children, opts)
@@ -373,11 +560,22 @@ def _render_block(block: BlockNode, opts: MarkdownRenderOptions) -> str:
     if isinstance(block, HorizontalRule):
         return "---"
     if isinstance(block, Table):
-        return _render_table(block)
+        return _render_table(block, opts)
     if isinstance(block, DirectiveMacro):
         return _render_directive(block, opts)
     if isinstance(block, OpaqueBlock):
+        if opts.profile == "readable":
+            return "> [Unsupported Confluence content]"
+        if opts.profile == "editable" and is_round_trippable_table_wrapper(block.raw_xml, block.source_path):
+            return serialize_opaque(block.raw_xml, block.opaque_id)
+        if opts.profile == "editable" and opts.protected_projections:
+            return protected_projection(block)
+        if opts.profile == "editable":
+            marker = UnsupportedMarker(kind="block", macro=_opaque_macro_name(block.raw_xml))
+            return "> \\[Unsupported Confluence content\\]\n\n" + _render_unsupported_marker(marker)
         return serialize_opaque(block.raw_xml, block.opaque_id)
+    if isinstance(block, UnsupportedMarker):
+        return _render_unsupported_marker(block)
     if isinstance(block, PassthroughComment):
         # Caller-owned HTML comment — emit verbatim. The content
         # already includes the ``<!--`` / ``-->`` sentinels so the
@@ -417,7 +615,19 @@ def _render_list(
             lines.append(f"{indent}{marker}")
             continue
         # First line carries the bullet marker.
-        lines.append(f"{indent}{marker}{body_lines[0]}")
+        first_line = body_lines[0]
+        # When the item's first child is itself a list, that nested list already
+        # rendered its own first line at ``body_indent`` (``indent`` + marker
+        # width). Prepending this item's marker on top of that indent would push
+        # the nested content 4+ columns right, and Markdown reparses the
+        # over-indented line as a code block (``- x\n  -     1. a`` -> code
+        # macro). Strip exactly one ``body_indent`` prefix so the parent marker
+        # replaces it: ``- x\n  - 1. a``. A first child that is inline text, a
+        # code block, or any non-list block keeps its own indentation contract
+        # and must not take this branch.
+        if item.children and isinstance(item.children[0], List) and first_line.startswith(body_indent):
+            first_line = first_line[len(body_indent) :]
+        lines.append(f"{indent}{marker}{first_line}")
         # Continuation lines sit under the bullet body column. Lines
         # that already start with the body indent are passed through
         # (this happens for nested lists that rendered themselves with
@@ -453,7 +663,8 @@ def _render_list_item_body(
             # Nested list renders itself with its own indentation.
             parts.append(_render_list(child, opts, body_indent))
         elif isinstance(child, Paragraph):
-            parts.append(_render_inline_text(child.children).strip("\n"))
+            paragraph = _render_inline_text(child.children, opts=opts).strip("\n")
+            parts.append(_protect_boundary_nbsp(paragraph))
         elif isinstance(child, CodeBlock):
             # Code blocks are rendered verbatim; indent all lines.
             code = _render_block(child, opts)
@@ -470,10 +681,7 @@ def _render_list_item_body(
     for i in range(1, len(parts)):
         prev = item.children[i - 1]
         curr = item.children[i]
-        tight = (
-            isinstance(prev, (Paragraph, List))
-            and isinstance(curr, List)
-        )
+        tight = isinstance(prev, (Paragraph, List)) and isinstance(curr, List)
         sep = "\n" if tight else "\n\n"
         result.append(sep + parts[i])
     return "".join(result)
@@ -483,14 +691,13 @@ _COLSPAN_MARK = "<"
 _ROWSPAN_MARK = "^"
 
 
-def _render_table(table: Table) -> str:
+def _render_table(table: Table, opts: MarkdownRenderOptions) -> str:
     def render_cell_text(cell: TableCell) -> str:
-        # GFM table cells are single-line. A real ``\n`` (or the
-        # ``  \n`` Markdown hard-break sequence) would terminate the
-        # cell early, so we substitute hard breaks with the inline
-        # ``<br>`` HTML tag — which GFM passes through verbatim.
-        text = _render_inline_text(cell.children).strip()
-        text = text.replace("  \n", "<br>")
+        # GFM table cells are single-line. HardBreak already renders as
+        # canonical ``<br>``; turn any remaining soft-break newlines into
+        # the same inline spelling so they cannot terminate the cell.
+        text = _render_inline_text(cell.children, opts=opts, table_cell=True).strip(" \t\r\n")
+        text = _protect_boundary_nbsp(text)
         text = text.replace("\n", "<br>")
         return text
 
@@ -505,31 +712,47 @@ def _render_table(table: Table) -> str:
             if entry is None:
                 rendered.append("")
             elif isinstance(entry, str):
-                rendered.append(entry)
+                rendered.append("" if opts.profile == "readable" else entry)
             else:
                 rendered.append(render_cell_text(entry))
         return "| " + " | ".join(rendered) + " |"
 
     lines: list[str] = []
     if table.header is not None:
-        # The header row may itself span multiple visual rows if any
-        # of its cells uses rowspan > 1.
-        header_rows = (
-            max((c.rowspan for c in table.header.cells), default=1)
-            if table.header.cells
-            else 1
-        )
-        for r in grid[:header_rows]:
-            lines.append(render_grid_row(r))
-        body_grid = grid[header_rows:]
+        # GFM permits exactly one row before the separator. Rowspan
+        # continuations therefore live in the body grid and are folded
+        # back into the header cell by the Markdown parser.
+        lines.append(render_grid_row(grid[0]))
+        body_grid = grid[1:]
     else:
         # GFM requires a header row — emit an empty one.
         lines.append("| " + " | ".join([""] * n_cols) + " |")
         body_grid = grid
-    lines.append("| " + " | ".join(["---"] * n_cols) + " |")
+    delimiters: list[str] = []
+    for column in range(n_cols):
+        align = table.alignments[column] if column < len(table.alignments) else CellAlign.NONE
+        delimiters.append(
+            {
+                CellAlign.LEFT: ":---",
+                CellAlign.CENTER: ":---:",
+                CellAlign.RIGHT: "---:",
+            }.get(align, "---")
+        )
+    lines.append("| " + " | ".join(delimiters) + " |")
     for r in body_grid:
         lines.append(render_grid_row(r))
     return "\n".join(lines)
+
+
+def _opaque_macro_name(raw_xml: str) -> str | None:
+    match = re.search(r'\bac:name="([^"]+)"', raw_xml)
+    return match.group(1) if match else None
+
+
+def _render_unsupported_marker(node: UnsupportedMarker) -> str:
+    macro = f' macro="{_escape_attr(node.macro)}"' if node.macro else ""
+    occurrence = f' occurrence="{_escape_attr(node.occurrence_id)}"' if node.occurrence_id else ""
+    return f"<!-- cfxmark:unsupported kind={node.kind}{macro}{occurrence} push-safe=false -->"
 
 
 def _expand_table_grid(
@@ -554,73 +777,23 @@ def _expand_table_grid(
     if not rows:
         return []
 
-    # First pass: determine total column count from the row that
-    # consumes the most columns (sum of colspans plus inherited
-    # rowspan continuations from above).
-    n_cols = 0
-    pending_above: dict[int, int] = {}
-    row_widths: list[int] = []
-    for row in rows:
-        col = 0
-        cell_index = 0
-        while cell_index < len(row.cells) or any(
-            v > 0 for v in pending_above.values()
-        ):
-            while pending_above.get(col, 0) > 0:
-                pending_above[col] -= 1
-                col += 1
-            if cell_index >= len(row.cells):
-                break
-            cell = row.cells[cell_index]
-            for span_col in range(cell.colspan):
-                if cell.rowspan > 1:
-                    pending_above[col + span_col] = max(
-                        pending_above.get(col + span_col, 0),
-                        cell.rowspan - 1,
-                    )
-            col += cell.colspan
-            cell_index += 1
-        row_widths.append(col)
-        n_cols = max(n_cols, col)
-        # Decay any over-counted rowspans for this row.
-        pending_above = {k: v for k, v in pending_above.items() if v > 0}
+    try:
+        layout = bounded_table_grid_layout(rows)
+    except TableGridError as error:
+        raise ConversionError(str(error)) from error
+    n_cols = layout.width
 
-    # Second pass: build the grid.
-    grid: list[list[TableCell | str | None]] = []
-    pending: dict[int, TableCell] = {}
-    pending_left: dict[int, int] = {}
-    for row in rows:
-        grid_row: list[TableCell | str | None] = [None] * n_cols
-        col = 0
-        for cell in row.cells:
-            while col < n_cols and col in pending and pending_left[col] > 0:
-                grid_row[col] = _ROWSPAN_MARK
-                pending_left[col] -= 1
-                if pending_left[col] == 0:
-                    del pending[col]
-                    del pending_left[col]
-                col += 1
-            if col >= n_cols:
-                break
-            grid_row[col] = cell
-            for offset in range(1, cell.colspan):
-                if col + offset < n_cols:
-                    grid_row[col + offset] = _COLSPAN_MARK
-            if cell.rowspan > 1:
-                for offset in range(cell.colspan):
-                    pending[col + offset] = cell
-                    pending_left[col + offset] = cell.rowspan - 1
-            col += cell.colspan
-        # Tail: any unfinished rowspan continuations after the last cell.
-        while col < n_cols:
-            if col in pending and pending_left[col] > 0:
-                grid_row[col] = _ROWSPAN_MARK
-                pending_left[col] -= 1
-                if pending_left[col] == 0:
-                    del pending[col]
-                    del pending_left[col]
-            col += 1
-        grid.append(grid_row)
+    grid: list[list[TableCell | str | None]] = [[None] * n_cols for _row in rows]
+    for row_index, (row, anchors) in enumerate(zip(rows, layout.anchor_columns, strict=True)):
+        for cell, column in zip(row.cells, anchors, strict=True):
+            for covered_row in range(row_index, min(len(rows), row_index + cell.rowspan)):
+                for covered_column in range(column, column + cell.colspan):
+                    if (covered_row, covered_column) == (row_index, column):
+                        grid[covered_row][covered_column] = cell
+                    elif covered_row == row_index:
+                        grid[covered_row][covered_column] = _COLSPAN_MARK
+                    else:
+                        grid[covered_row][covered_column] = _ROWSPAN_MARK
     return grid
 
 
@@ -672,9 +845,19 @@ def render_md(
     """
 
     body = _render_blocks(document.children, options)
-    payloads = _collect_inline_opaque_payloads(document)
+    payloads = (
+        _collect_inline_opaque_payloads(document)
+        if options.profile == "legacy"
+        else {
+            opaque_id: raw_xml
+            for opaque_id, raw_xml in _collect_inline_opaque_payloads(document).items()
+            if has_round_trippable_inline_payload(raw_xml)
+        }
+        if options.profile == "editable"
+        else {}
+    )
     parts: list[str] = []
-    if _document_has_special_markers(document, payloads):
+    if options.profile == "legacy" and _document_has_special_markers(document, payloads):
         parts.append(HEADER_NOTICE)
         parts.append("")
     parts.append(body.rstrip("\n"))
@@ -726,7 +909,7 @@ def _document_has_special_markers(
         nonlocal found
         if found:
             return
-        if isinstance(node, (OpaqueBlock, DirectiveMacro)):
+        if isinstance(node, (OpaqueBlock, DirectiveMacro, InlineDirectiveMacro)):
             found = True
             return
         for attr in ("children", "items", "cells", "body"):

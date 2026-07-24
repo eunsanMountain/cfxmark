@@ -58,3 +58,5 @@ htmlcov/
 /tests/corpus/*.json
 /tests/corpus/private/
 /tests/to_md/
+
+.serena/

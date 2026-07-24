@@ -31,7 +31,7 @@ h3. *TO-BE*
 |Alpha ON|FLAG_ALPHA = 0x2 (On)|
 |Alpha OFF|FLAG_ALPHA = 0x1 (Off)|
 
-(flag_alt is an internal interface signal named IDC.u8AltFlag)
+(flag_alt is an internal interface signal named MOD.u8AltFlag)
 
 h3. *Source*
  * Internal requirement

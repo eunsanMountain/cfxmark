@@ -51,33 +51,21 @@ def test_emphasis() -> None:
 
 def test_strong_korean_word_flank_falls_back_to_html() -> None:
     # Both sides are Korean word characters → must use raw <strong>.
-    assert (
-        md("<p>한국어<strong>볼드</strong>입니다</p>")
-        == "한국어<strong>볼드</strong>입니다"
-    )
+    assert md("<p>한국어<strong>볼드</strong>입니다</p>") == "한국어<strong>볼드</strong>입니다"
 
 
 def test_strong_cjk_ideograph_flank_falls_back_to_html() -> None:
     # Chinese ideographs are also alphanumeric → same fallback applies.
-    assert (
-        md("<p>汉字<strong>粗体</strong>文本</p>")
-        == "汉字<strong>粗体</strong>文本"
-    )
+    assert md("<p>汉字<strong>粗体</strong>文本</p>") == "汉字<strong>粗体</strong>文本"
 
 
 def test_strong_with_spaces_around_korean_uses_plain_markdown() -> None:
     # Spaces on both sides break the word-char flank → plain ``**`` is safe.
-    assert (
-        md("<p>한국어 <strong>bold</strong> 한국어</p>")
-        == "한국어 **bold** 한국어"
-    )
+    assert md("<p>한국어 <strong>bold</strong> 한국어</p>") == "한국어 **bold** 한국어"
 
 
 def test_emphasis_korean_word_flank_falls_back_to_html() -> None:
-    assert (
-        md("<p>한국어<em>강조</em>입니다</p>")
-        == "한국어<em>강조</em>입니다"
-    )
+    assert md("<p>한국어<em>강조</em>입니다</p>") == "한국어<em>강조</em>입니다"
 
 
 def test_emphasis_pure_korean_no_flank_uses_plain_markdown() -> None:
@@ -86,34 +74,22 @@ def test_emphasis_pure_korean_no_flank_uses_plain_markdown() -> None:
 
 
 def test_strikethrough_korean_word_flank_falls_back_to_html() -> None:
-    assert (
-        md("<p>한국어<del>취소</del>입니다</p>")
-        == "한국어<del>취소</del>입니다"
-    )
+    assert md("<p>한국어<del>취소</del>입니다</p>") == "한국어<del>취소</del>입니다"
 
 
 def test_strong_cjk_boundary_inside_list_item() -> None:
     # Same policy must apply inside block containers (lists, headings …).
-    assert (
-        md("<ul><li>항목<strong>볼드</strong>끝</li></ul>")
-        == "- 항목<strong>볼드</strong>끝"
-    )
+    assert md("<ul><li>항목<strong>볼드</strong>끝</li></ul>") == "- 항목<strong>볼드</strong>끝"
 
 
 def test_strong_cjk_boundary_inside_heading() -> None:
-    assert (
-        md("<h2>제목<strong>강조</strong></h2>")
-        == "## 제목<strong>강조</strong>"
-    )
+    assert md("<h2>제목<strong>강조</strong></h2>") == "## 제목<strong>강조</strong>"
 
 
 def test_strong_cjk_boundary_mixed_ascii_and_korean_flank() -> None:
     # Flank detection only looks at the adjacent character; mixed ASCII and
     # Korean on either side still counts as word-flank and triggers fallback.
-    assert (
-        md("<p>prefix한국어<strong>볼드</strong>suffix한국어</p>")
-        == "prefix한국어<strong>볼드</strong>suffix한국어"
-    )
+    assert md("<p>prefix한국어<strong>볼드</strong>suffix한국어</p>") == "prefix한국어<strong>볼드</strong>suffix한국어"
 
 
 # ---------------------------------------------------------------------------
@@ -165,10 +141,7 @@ def test_inline_code() -> None:
 
 
 def test_link() -> None:
-    assert (
-        md('<p><a href="https://example.com">label</a></p>')
-        == "[label](https://example.com)"
-    )
+    assert md('<p><a href="https://example.com">label</a></p>') == "[label](https://example.com)"
 
 
 # ---------------------------------------------------------------------------
@@ -205,14 +178,10 @@ def test_code_macro_with_language() -> None:
 
 
 def test_image_attachment_with_dimensions_encoded() -> None:
-    cfx = (
-        '<ac:image ac:width="300" ac:height="200">'
-        '<ri:attachment ri:filename="foo.png"/>'
-        "</ac:image>"
-    )
+    cfx = '<ac:image ac:width="300" ac:height="200"><ri:attachment ri:filename="foo.png"/></ac:image>'
     out = md(f"<p>{cfx}</p>")
     assert "foo.png" in out
-    assert "cfxmark:w=300,h=200" in out
+    assert "<!-- cfxmark:img w=300 h=200 -->" in out
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "note": "Versioned SSOT for the storage round-trip supported corpus (W3). Each fixture declares one disposition; the property test dispatches the matching contract. Fixtures are synthetic, structural XHTML only -- no company data.",
+  "fixtures": [
+    {
+      "id": "nol_d1_start1",
+      "disposition": "lossless",
+      "storage": "<ul><li>step<ol><li>a</li></ol></li></ul>",
+      "note": "Control: depth-1 nested ordered list (implicit start=1) round-trips; must stay passing."
+    },
+    {
+      "id": "nol_d2_firstchild_start1",
+      "disposition": "lossless",
+      "storage": "<ul><li>x<ul><li><ol><li>a</li></ol></li></ul></li></ul>",
+      "note": "Track A target: depth-2 first-child list. Was reparsed as a code macro before the renderer repair."
+    },
+    {
+      "id": "nol_d2_pure_firstchild_start1",
+      "disposition": "lossless",
+      "storage": "<ul><li><ul><li><ol><li>a</li></ol></li></ul></li></ul>",
+      "note": "Track A target: depth-2 list whose every item's first child is itself a list."
+    },
+    {
+      "id": "nol_d3_firstchild_start1",
+      "disposition": "lossless",
+      "storage": "<ul><li><ul><li><ul><li><ol><li>a</li></ol></li></ul></li></ul></li></ul>",
+      "note": "Track A composition proof: the first-child de-indent repair applies at every nesting level."
+    },
+    {
+      "id": "list_first_child_text",
+      "disposition": "lossless",
+      "storage": "<ul><li>text<ul><li>a</li></ul></li></ul>",
+      "note": "Adversarial guard: the item's first child is inline text, so the de-indent branch must NOT fire."
+    },
+    {
+      "id": "list_first_child_codeblock",
+      "disposition": "lossless",
+      "storage": "<ul><li><ac:structured-macro ac:name=\"code\"><ac:plain-text-body><![CDATA[x]]></ac:plain-text-body></ac:structured-macro></li></ul>",
+      "note": "Adversarial guard: a genuine code macro must survive (round-trips as a code fence), not be indent-stripped."
+    },
+    {
+      "id": "nol_start2_paragraph_shape",
+      "disposition": "unsupported_fail_closed",
+      "storage": "<ul><li>step<ol start=\"2\"><li>b</li></ol></li></ul>",
+      "diagnostic_code": "nested-ordered-list-start-unrepresentable",
+      "note": "Track B: a nested ordered list whose first number is not 1 cannot interrupt inline list-item text in Markdown, so the ordered list is an unrepresentable shape. It fails closed (not push-safe, fatal proof) and is named by the nested-ordered-list-start-unrepresentable diagnostic. There is no automatic migration: rewrite the list as a flat structure in the remote (Confluence web UI or an explicit storage-format workflow), then re-pull."
+    }
+  ]
+}

@@ -10,15 +10,73 @@ the grade-III escape hatches.
 
 * `<ac:>` is `xmlns:ac="http://atlassian.com/content"`.
 * `<ri:>` is `xmlns:ri="http://atlassian.com/resource/identifier"`.
-* "Lossless after canonicalization" means
+* "Lossless after canonicalization" is a construct-level claim for the
+  supported mapping table and means
   `cfxmark.canonicalize_cfx(original) == cfxmark.canonicalize_cfx(round_tripped)`
   — not byte-for-byte equality of the raw XML, since Confluence
   injects volatile attributes and editor cosmetics that have no
-  semantic role.
+  semantic role. It is not a blanket authorization to publish an edited
+  remote page.
 * Volatile attributes stripped during canonicalization:
   `ac:macro-id`, `ac:local-id`, `ac:schema-version`, `ac:thumbnail`,
   `ac:border`, `ac:align`, `ri:version-at-save`, `data-uuid`,
   `data-highlight-colour`.
+
+## Managed conversion and informed migration
+
+The public artifact pipeline distinguishes five values:
+
+* **S0** — fresh remote storage.
+* **M0** — deterministic baseline Markdown derived from S0.
+* **C0** — baseline candidate rendered from M0.
+* **M1** — user-edited Markdown.
+* **C1** — final candidate rendered from M1.
+
+`to_md_artifact(S0)` returns both `markdown` and `managed_markdown`.
+`markdown` is the body used by source ranges and source maps.
+`managed_markdown` is the user-file projection with disclosure, summary, and
+per-occurrence comments. Prefixing the latter does not move ranges recorded
+against the former.
+
+The artifact's `migration_report` classifies actual diagnostic producers.
+Every `MigrationOccurrence.occurrence_id` is derived from the source storage
+hash, diagnostic code, stable location identity, and ordinal. A code absent
+from the producer inventory is not automatically exempt or equivalent. An
+occurrence ID reused across different physical locations is preserved as an
+ambiguity and makes the candidate fatal; aggregation never turns that collision
+into one consent atom.
+
+Calling `to_cfx_artifact(M1, base_artifact=..., splice_source=S0)` creates a
+managed candidate and independently derives:
+
+* Markdown edit operations from M0 -> M1;
+* atomic migration occurrences from S0 -> C0; and
+* the complete storage-leaf diff from S0 -> C1.
+
+The bidirectional storage source map must attribute every final changed leaf
+to exactly one owner: an actual edit operation ID or an actual migration
+occurrence ID. Delete ownership retains a tombstone identity. Move ownership
+is accepted only for globally unique correspondence. Zero owners, multiple
+owners, migration/user overlap, incomplete or ambiguous maps, duplicate
+identity, and move-plus-edit ambiguity are fatal. Stage membership alone is
+not ownership evidence.
+
+The immutable `ownership_proof` contains fingerprints for S0/M0/C0/M1/C1,
+converter and profile, source leaf snapshots, intended and migration-owned
+changes, unclassified/multiply-owned/overlapping changes, and fatal diagnostic
+codes. `validate_managed_cfx_artifact(candidate, source_storage=fresh_s0,
+options=options)`
+rebuilds the semantic matcher and source-map claims from the candidate
+document, binds every intended leaf to the independently derived edit
+operation, requires an exact fresh-source match, and rejects a demoted,
+incomplete, or fatal envelope before publication. A stored owner ID or stage
+diff membership is not accepted as its own attribution witness.
+
+Unknown or opaque content therefore has two explicit contracts. The legacy
+profile can re-emit a verified opaque XML payload while its markers remain
+valid. Editable/managed projections either splice source-bound content with a
+complete proof or report the resulting migration; they do not silently treat
+opaque preservation as universal.
 
 ## Grade I — Native CommonMark / GFM
 
@@ -109,10 +167,11 @@ the opaque mechanisms documented in [`OPAQUE.md`](OPAQUE.md):
   position (user mentions, inline jira issue references, …) so the
   surrounding paragraph stays native Markdown.
 
-Opaque blocks survive `cfx → md → cfx` byte-for-byte, **including**
-the `ac:macro-id` UUID. Confluence therefore treats the round-tripped
-macro as the same instance as the original — preserving comments,
-attachments, and permissions attached to the macro.
+In the legacy profile, an intact and verified opaque block is re-emitted
+byte-for-byte, including the `ac:macro-id` UUID. Confluence therefore treats
+that re-emitted macro as the same instance. Editable/managed profiles report
+unsupported content and bind any accepted source splice to the managed proof
+described above.
 
 ## Asset markers
 

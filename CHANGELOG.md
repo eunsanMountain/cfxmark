@@ -5,6 +5,159 @@ All notable changes to **cfxmark** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.5.0] — 2026-07-24
+
+### Known limitations
+- A non-1 `<ol start="N">` nested list that follows inline list-item text is an
+  **unrepresentable shape**: Markdown cannot express it (CommonMark forbids a
+  non-1 ordered list from interrupting a paragraph), so managed conversion
+  **fails closed** and names it with the `nested-ordered-list-start-unrepresentable`
+  diagnostic. It is **not** auto-migrated and cannot be resolved by a Markdown
+  push. To publish the page, rewrite the list as a flat structure in the remote
+  (Confluence web UI or an explicit storage-format workflow), then re-pull.
+- A storage change that cannot be attributed to a user edit or a named
+  migration occurrence fails closed before any write:
+  `multiple-change-owners` when more than one occurrence could equally own it,
+  `unclassified-storage-change` when none does.
+
+### Added
+- Collateral round-trip occurrence codes, each backed by a storage witness so
+  the ownership proof can attribute the change: `element-attribute-omitted`,
+  `element-attribute-normalized`, `table-colgroup-omitted`,
+  `table-cell-paragraph-unwrapped`, `table-cell-paragraphs-collapsed`, and
+  `body-only-table-header-synthesized`. All are consent-gated.
+- Ordered-composition witness: composite migration effects are attributed to
+  their contributing occurrences; a composition that does not fully explain a
+  change grants no ownership.
+- Body-less structured macros (e.g. `<ac:structured-macro ac:name="toc"/>`
+  inside a heading) round-trip byte-exactly through the opaque payload
+  transport, preserving macro identity and parameters.
+
+### Fixed
+- A bare, user-authored HTML comment (`<!-- ... -->`) in Markdown no longer
+  **fatals** the managed Markdown→storage update. Previously the parser dropped
+  the comment with a generic `"unmatched inline HTML span dropped"` warning that
+  fell through to the `conversion-note` fallback and resolved to a **fatal**
+  effect, blocking the whole page. The parser now recognises a genuine comment by
+  its `<!--`/`-->` syntax and emits a distinct, value-free `"HTML comment dropped"`
+  producer message, classified as the new `html-comment-dropped` code with the
+  **`removed`** effect — a describable, consent-required loss (the push-side mirror
+  of the pull-side `xml-comment-dropped`). Like every source loss it is a blocking
+  content_loss, so `push_safe` is `False` and the page remains publishable through
+  informed consent (not a silent drop); the comment is absent from the candidate
+  storage.
+  Processing instructions (`<? ?>`), CDATA (`<![CDATA[ ]]>`) and declarations
+  (`<!DOCTYPE>`) share the same fall-through but are **not** comments, so they keep
+  their existing `"unmatched inline HTML span dropped"` message and path. Content
+  HTML (`<div>`, unknown `<span>` attributes) still classifies as
+  `html-tag-stripped`, and the `cfxmark:img` functional comment is unaffected
+  (consumed in pre-processing).
+
+### Added
+- `ConversionError` now carries an optional, value-free `reason_code` attribute
+  and cfxmark exports a closed public allowlist
+  `PUBLIC_CONVERSION_REASON_CODES` (currently `{"semantic-mapping-ambiguous"}`).
+  When a coded cfxmark failure is wrapped into a `ConversionError`, the wrap site
+  sets `reason_code` to the wrapped error's code only if it is in the allowlist,
+  so a consumer can distinguish a semantic-mapping-ambiguous failure from any
+  other conversion error via a stable machine code — never by parsing the
+  message string. Any code outside the allowlist yields `reason_code is None`.
+
+- Added managed Markdown artifacts with typed diagnostics, preservation
+  signatures, bidirectional storage/source maps, edit-operation provenance,
+  and fail-closed ambiguity reporting.
+- Added fresh-remote subtree splice artifacts so unchanged or uniquely moved
+  blocks retain remote structure and attributes while edited sibling blocks are
+  rendered from Markdown.
+- Added marker-free protected-region projections for common Confluence links,
+  dates, task lists, cell lists, nested structures, and opaque macros, including
+  typed Markdown ranges and status-only task change evidence.
+- Added deterministic image metadata comments using a validated, space-delimited
+  `k=v` grammar and canonical `<br>` hard-break rendering.
+- Added typed table-cell background presentation artifacts with explicit,
+  server-readback-derived render capabilities and nullable support for valid
+  but unverified values.
+- Added stable table matching that preserves presentation through unambiguous
+  table reordering and cell-text edits while rejecting duplicate identities.
+
+### Fixed
+- Bound managed candidates to the exact conversion options and table
+  presentation authority used to render them, and replayed colored-cell source
+  maps through both public validators against fresh source storage.
+- Preserved inter-element whitespace tails for unchanged remote subtrees when
+  an unrelated block is appended, avoiding storage churn outside the intended
+  Markdown edit.
+- Normalized invalid public text inputs to typed cfxmark errors instead of
+  leaking raw Unicode or XML parser exceptions.
+- Preserved code-macro identity, headerless-table topology, mixed alignment,
+  exact remote table-cell presentation, and unsupported remote subtrees during
+  unrelated Markdown edits while rejecting ambiguous correspondence.
+- Preserved escaped commas and pipes in Jira image targets and alternative
+  text without corrupting parser or renderer boundaries.
+- Rejected oversized, amplification-prone, or overlapping table spans before
+  logical-grid allocation, preserving the source table opaquely with a blocking
+  diagnostic while keeping valid inherited-rowspan alignment fixed-point.
+- Restricted leading-pipe Markdown table detection to structurally valid GFM
+  tables so prose and inline-code pipes remain ordinary paragraphs.
+- Kept endpoint whitespace, empty paragraphs, and list-item paragraph wrappers
+  visible to preservation diagnostics instead of hiding collateral loss during
+  canonicalization.
+- Classified every unsupported block or inline Confluence construct as an
+  occurrence-scoped managed-pull blocker instead of reporting the artifact as
+  ready to edit.
+- Preserved empty link labels without synthesizing visible text, and made
+  managed artifacts fail closed whenever their generated Markdown would cause
+  a storage change before any user edit.
+- Added an occurrence-bound storage migration resolver so an approved emoticon
+  conversion cannot authorize unrelated renderer normalization.
+- Reported residual round-trip drift alongside approvable migration diagnostics
+  during pull, including the first changed storage semantic path.
+- Prevented root-level XML comments and processing instructions from entering
+  a crashing standalone C14N path, while preserving unapproved comments,
+  processing instructions, fragment text, and tails during exact migrations.
+- Bound candidate storage bytes to their source-map provenance and separated
+  direct AST edits from serializer-ancestor topology changes so callers can
+  reject same-node collateral storage leaves before publishing.
+
+### Removed
+- Removed the proofless `cfxmark.confluence` REST writer and its namespace-only
+  extra. cfxmark now enforces its converter-only boundary; transport callers
+  must publish source-bound managed candidates after fresh-source validation.
+
+## [0.4.1] — 2026-07-14
+
+### Added
+- Added explicit `legacy`, `editable`, and `readable` Markdown profiles with
+  `push_safe` and `losses` diagnostics.
+- Editable Markdown now carries compact semantic color categories, paragraph
+  alignment, and image size, thumbnail, and alignment metadata.
+- Added independent round-trip coverage for NBSP normalization, `colspan`, and
+  `rowspan`, including spans in non-leading table columns.
+- Added readable, round-trip-safe Markdown forms for inline Jira macros and
+  paragraph-only table-of-contents macros.
+
+### Fixed
+- Flattened redundant strong markup so nested or adjacent `<strong>` elements
+  no longer produce ambiguous `****` delimiters.
+- Made boundary NBSP encoding and merged-table reconstruction fixed-point
+  stable across repeated conversions.
+- Kept header-cell row spans in a valid GFM table and preserved paragraph
+  alignment when the paragraph contains hard breaks.
+- Preserved simultaneous foreground and background colors. Unknown exact
+  colors now round-trip with a diagnostic instead of being silently removed.
+- Made unsupported-content markers fixed-point stable, include the macro name
+  when available, and refuse unsafe Markdown-to-storage conversion.
+- Preserved image metadata when attachment links are rewritten to sidecars.
+- Treated Confluence's structural `content-wrapper` div in table cells as
+  transparent while leaving styled divs and nested tables unsupported.
+
+### Changed
+- Editable and readable profiles omit raw opaque XML. Unsupported content is
+  represented by a local marker and makes editable output unsafe to publish.
+- Legacy profile behavior remains the public API default for compatibility.
+
 ## [0.4.0] — 2026-04-13
 
 ### Added
@@ -457,8 +610,8 @@ Confluence storage fragments compare equal:
   - 8 security regression tests
   - 1 corpus golden-file test (skipped if no private corpus available)
   - 1 Hypothesis property-based round-trip test (100 random documents)
-- Verified against 9 production Confluence pages totalling ~290 KB
-  of XHTML — all round-trip with byte-identical canonical form.
+- Verified against a corpus of 9 substantial Confluence pages totalling
+  ~290 KB of XHTML — all round-trip with byte-identical canonical form.
 
 ### Known limitations
 

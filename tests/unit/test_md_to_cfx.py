@@ -16,10 +16,7 @@ def assert_md_to_cfx(markdown: str, expected_cfx: str) -> None:
     actual = cfxmark.canonicalize_cfx(result.xhtml)
     expected = cfxmark.canonicalize_cfx(expected_cfx)
     assert actual == expected, (
-        f"Markdown → CFX mismatch.\n"
-        f"  markdown: {markdown!r}\n"
-        f"  expected: {expected!r}\n"
-        f"  actual:   {actual!r}"
+        f"Markdown → CFX mismatch.\n  markdown: {markdown!r}\n  expected: {expected!r}\n  actual:   {actual!r}"
     )
 
 
@@ -140,9 +137,7 @@ def test_code_fence_with_language() -> None:
 def test_code_fence_without_language() -> None:
     md = "```\nplain text\n```"
     expected = (
-        '<ac:structured-macro ac:name="code">'
-        "<ac:plain-text-body>plain text</ac:plain-text-body>"
-        "</ac:structured-macro>"
+        '<ac:structured-macro ac:name="code"><ac:plain-text-body>plain text</ac:plain-text-body></ac:structured-macro>'
     )
     assert_md_to_cfx(md, expected)
 
@@ -162,12 +157,7 @@ def test_horizontal_rule() -> None:
 
 def test_simple_table() -> None:
     md = "| a | b |\n| --- | --- |\n| 1 | 2 |"
-    expected = (
-        "<table>"
-        "<thead><tr><th>a</th><th>b</th></tr></thead>"
-        "<tbody><tr><td>1</td><td>2</td></tr></tbody>"
-        "</table>"
-    )
+    expected = "<table><thead><tr><th>a</th><th>b</th></tr></thead><tbody><tr><td>1</td><td>2</td></tr></tbody></table>"
     assert_md_to_cfx(md, expected)
 
 

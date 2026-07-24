@@ -1,4 +1,5 @@
 """cfxmark AST → Jira wiki markup renderer."""
+
 from __future__ import annotations
 
 import logging
@@ -21,6 +22,7 @@ from cfxmark.ast import (
     HorizontalRule,
     Image,
     InlineCode,
+    InlineDirectiveMacro,
     InlineNode,
     InlineOpaque,
     Link,
@@ -38,6 +40,7 @@ from cfxmark.ast import (
     TableRow,
     Text,
     Underline,
+    UnsupportedMarker,
 )
 
 _log = logging.getLogger("cfxmark.renderers.jira_wiki")
@@ -99,7 +102,12 @@ _DROPPED_LABELS: dict[str, str] = {
 # ``none``: alias for ``jira`` (identity). Exposed so callers that do
 # their own heading math upstream can be explicit about opting out.
 _HEADING_PROMOTION_CONFLUENCE: dict[int, int] = {
-    1: 1, 2: 2, 3: 2, 4: 3, 5: 4, 6: 5,
+    1: 1,
+    2: 2,
+    3: 2,
+    4: 3,
+    5: 4,
+    6: 5,
 }
 _HEADING_PROMOTION_JIRA: dict[int, int] = {1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6}
 _HEADING_PROMOTION_TABLES: dict[str, dict[int, int]] = {
@@ -121,16 +129,31 @@ def _escape_wiki(content: str) -> str:
     return _ESCAPE_RE.sub(lambda m: "\\" + m.group(0), content)
 
 
+def _escape_image_component(content: str, *, parameter: bool = False) -> str:
+    """Escape one field in Jira's ``!target|key=value!`` grammar."""
+
+    escaped: list[str] = []
+    for ch in content:
+        if ch in {"\\", "!"} or (parameter and ch == ",") or _ESCAPE_RE.fullmatch(ch):
+            escaped.append("\\")
+        escaped.append(ch)
+    return "".join(escaped)
+
+
 def _inline_text(nodes: tuple[InlineNode, ...]) -> str:
     """Return flattened plain text content for heading/section comparisons."""
     parts: list[str] = []
     for n in nodes:
         if isinstance(n, Text):
             parts.append(n.content)
-        elif isinstance(n, (Emphasis, Strong, Strikethrough, Subscript, Superscript, Underline, ColorSpan, Citation, Link)):
+        elif isinstance(
+            n, (Emphasis, Strong, Strikethrough, Subscript, Superscript, Underline, ColorSpan, Citation, Link)
+        ):
             parts.append(_inline_text(n.children))
         elif isinstance(n, InlineCode):
             parts.append(n.content)
+        elif isinstance(n, InlineDirectiveMacro):
+            parts.append(_inline_directive_text(n))
         elif isinstance(n, (SoftBreak, HardBreak)):
             parts.append(" ")
         # Image, InlineOpaque contribute nothing textual
@@ -167,17 +190,37 @@ def _render_inline(nodes: tuple[InlineNode, ...], ctx: JiraWikiContext) -> str:
             buf.append("{{" + n.content + "}}")
         elif isinstance(n, Link):
             inner = _render_inline(n.children, ctx)
+            if n.title:
+                ctx.warnings.append("link title is not representable in Jira wiki and was omitted")
             buf.append(f"[{inner}|{n.url}]" if inner else f"[{n.url}]")
         elif isinstance(n, Image):
-            basename = n.src.rsplit("/", 1)[-1]
+            target = n.src if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", n.src) else n.src.rsplit("/", 1)[-1]
+            params: list[str] = []
             if n.alt:
-                buf.append(f"!{basename}|alt={_escape_wiki(n.alt)}!")
-            else:
-                buf.append(f"!{basename}!")
+                params.append(f"alt={_escape_image_component(n.alt, parameter=True)}")
+            if n.width is not None:
+                params.append(f"width={n.width}")
+            if n.height is not None:
+                params.append(f"height={n.height}")
+            if n.thumbnail:
+                params.append("thumbnail=true")
+            if n.align in {"center", "right"}:
+                params.append(f"align={n.align}")
+            suffix = f"|{','.join(params)}" if params else ""
+            buf.append(f"!{_escape_image_component(target)}{suffix}!")
+        elif isinstance(n, InlineDirectiveMacro):
+            buf.append("{{" + _inline_directive_text(n) + "}}")
+        elif isinstance(n, UnsupportedMarker):
+            ctx.warnings.append("unsupported Confluence marker omitted from Jira wiki output")
         elif isinstance(n, InlineOpaque):
             buf.append(f"(cfx:{n.label})")
             ctx.dropped_counts[_DROP_INLINE_OPAQUE] += 1
     return "".join(buf)
+
+
+def _inline_directive_text(node: InlineDirectiveMacro) -> str:
+    params = " ".join(f'{key}="{value}"' for key, value in node.parameters)
+    return f"{node.name} {params}".rstrip()
 
 
 def _render_table_row(row: TableRow, ctx: JiraWikiContext) -> str:
@@ -191,13 +234,11 @@ def _render_table_row(row: TableRow, ctx: JiraWikiContext) -> str:
     for cell in row.cells:
         if cell.colspan > 1:
             ctx.warnings.append(
-                f"Table cell colspan={cell.colspan} not supported in Jira wiki"
-                " — only the first cell is emitted"
+                f"Table cell colspan={cell.colspan} not supported in Jira wiki — only the first cell is emitted"
             )
         if cell.rowspan > 1:
             ctx.warnings.append(
-                f"Table cell rowspan={cell.rowspan} not supported in Jira wiki"
-                " — only the first cell is emitted"
+                f"Table cell rowspan={cell.rowspan} not supported in Jira wiki — only the first cell is emitted"
             )
         content = _render_inline(cell.children, ctx)
         # Collapse HardBreak newlines so the row stays on one line.
@@ -256,7 +297,13 @@ def _render_list(node: List, ctx: JiraWikiContext, marker_prefix: str = "") -> s
             elif isinstance(child, List):
                 rendered_nested.append(_render_list(child, ctx, marker_prefix=marker))
             else:
-                rendered_nested.append(_render_block(child, ctx))
+                if isinstance(child, CodeBlock):
+                    ctx.warnings.append(
+                        "code block inside a Jira list is emitted after the list because Jira wiki cannot nest it safely"
+                    )
+                    rendered_nested.append("\n" + _render_block(child, ctx))
+                else:
+                    rendered_nested.append(_render_block(child, ctx))
         lines.append(marker + " " + rendered_inline)
         lines.extend(r for r in rendered_nested if r)
     return "\n".join(lines)
@@ -279,7 +326,7 @@ def _render_block(node: BlockNode, ctx: JiraWikiContext) -> str:
         if lang and ctx.code_language_map and lang in ctx.code_language_map:
             lang = ctx.code_language_map[lang]
         fence_open = f"{{code:{lang}}}" if lang else "{code}"
-        content = node.content.rstrip("\n")
+        content = node.content
         if "{code}" in content:
             ctx.warnings.append(
                 "CodeBlock content contains '{code}' literal — Jira wiki cannot "
@@ -292,10 +339,7 @@ def _render_block(node: BlockNode, ctx: JiraWikiContext) -> str:
             if isinstance(child, BlockQuote):
                 # Jira wiki does not support nested {quote} — flatten
                 # the inner quote's children and emit a warning.
-                ctx.warnings.append(
-                    "nested blockquote flattened — Jira wiki does not"
-                    " support {quote} nesting"
-                )
+                ctx.warnings.append("nested blockquote flattened — Jira wiki does not support {quote} nesting")
                 for grandchild in child.children:
                     rendered = _render_block(grandchild, ctx)
                     if rendered:
@@ -319,6 +363,9 @@ def _render_block(node: BlockNode, ctx: JiraWikiContext) -> str:
             return f"{{{node.name}}}\n{body_text}\n{{{node.name}}}"
         ctx.warnings.append(f"unknown directive macro {node.name!r}: body inlined")
         return body_text
+    if isinstance(node, UnsupportedMarker):
+        ctx.warnings.append("unsupported Confluence marker omitted from Jira wiki output")
+        return ""
     if isinstance(node, OpaqueBlock):
         ctx.dropped_counts[_DROP_OPAQUE_BLOCK] += 1
         return ""
@@ -338,11 +385,7 @@ def _slice_section(document: Document, section_name: str) -> Document | None:
     blocks until the next H2 / HorizontalRule / EOF."""
     start_idx: int | None = None
     for i, child in enumerate(document.children):
-        if (
-            isinstance(child, Heading)
-            and child.level == 2
-            and _inline_text(child.children).strip() == section_name
-        ):
+        if isinstance(child, Heading) and child.level == 2 and _inline_text(child.children).strip() == section_name:
             start_idx = i + 1
             break
     if start_idx is None:
@@ -415,8 +458,7 @@ def render_jira_wiki(
     """
     if heading_promotion not in _HEADING_PROMOTION_TABLES:
         raise ValueError(
-            f"heading_promotion must be one of "
-            f"{sorted(_HEADING_PROMOTION_TABLES)}, got {heading_promotion!r}"
+            f"heading_promotion must be one of {sorted(_HEADING_PROMOTION_TABLES)}, got {heading_promotion!r}"
         )
     ctx = JiraWikiContext(
         heading_promotion=heading_promotion,
@@ -433,7 +475,7 @@ def render_jira_wiki(
     rendered = [_render_block(child, ctx) for child in target.children]
     rendered = [r for r in rendered if r]
     _finalize_warnings(ctx)
-    body = ("\n\n".join(rendered).rstrip() + "\n") if rendered else ""
+    body = ("\n\n".join(rendered).rstrip("\n") + "\n") if rendered else ""
     return body, ctx.warnings
 
 

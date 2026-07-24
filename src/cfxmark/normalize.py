@@ -16,11 +16,14 @@ routinely introduce:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 
 import lxml.etree as ET
 
 from cfxmark.parsers.cfx import _parse_fragment_to_element
+from cfxmark.presentation import parse_cell_background
 from cfxmark.xml_ns import (
     AC_URI,
     DEFAULT_COLOR_STYLE_RE,
@@ -102,9 +105,104 @@ _COSMETIC_STYLE_PROPS_TABLE_ONLY = frozenset(
     }
 )
 
-_TABLE_FAMILY_TAGS = frozenset(
-    {"table", "thead", "tbody", "tfoot", "tr", "th", "td", "col", "colgroup"}
+_TABLE_FAMILY_TAGS = frozenset({"table", "thead", "tbody", "tfoot", "tr", "th", "td", "col", "colgroup"})
+
+_SERVER_VOLATILE_ATTRS = frozenset(
+    {
+        ac_attr("macro-id"),
+        ac_attr("local-id"),
+        ri_attr("version-at-save"),
+    }
 )
+
+
+def _style_without_background(style: str) -> str:
+    declarations = []
+    for declaration in style.split(";"):
+        declaration = declaration.strip()
+        if not declaration:
+            continue
+        name, separator, _value = declaration.partition(":")
+        if separator and name.strip().lower() == "background-color":
+            continue
+        declarations.append(declaration)
+    return ";".join(declarations) + (";" if declarations else "")
+
+
+def _canonical_style_syntax(style: str) -> str:
+    """Normalize declaration whitespace without changing CSS meaning."""
+
+    declarations: list[str] = []
+    for declaration in style.split(";"):
+        declaration = declaration.strip()
+        if not declaration:
+            continue
+        name, separator, value = declaration.partition(":")
+        if not separator:
+            return style.strip()
+        property_name = name.strip().lower()
+        property_value = value.strip()
+        if property_name == "text-align":
+            property_value = property_value.lower()
+        declarations.append(f"{property_name}:{property_value}")
+    return ";".join(declarations)
+
+
+def _preservation_child(element: ET._Element) -> tuple[object, str | None]:
+    if isinstance(element.tag, str):
+        value: object = _preservation_element(element)
+    else:
+        value = ET.tostring(element, method="xml", with_tail=False, encoding="unicode")
+    return value, element.tail
+
+
+def _preservation_element(element: ET._Element) -> tuple[object, ...]:
+    tag = str(element.tag)
+    attributes = {str(name): str(value) for name, value in element.attrib.items() if name not in _SERVER_VOLATILE_ATTRS}
+    if strip_ns(tag) in {"td", "th"}:
+        background, _losses = parse_cell_background(attributes)
+        if background is not None:
+            attributes.pop("data-highlight-colour", None)
+            attributes.pop("bgcolor", None)
+            if "style" in attributes:
+                style = _style_without_background(attributes["style"])
+                if style:
+                    attributes["style"] = style
+                else:
+                    attributes.pop("style")
+            attributes["cfxmark:table-background"] = background.equality_key
+    if "style" in attributes:
+        attributes["style"] = _canonical_style_syntax(attributes["style"])
+    children = tuple(_preservation_child(child) for child in element)
+    return tag, tuple(sorted(attributes.items())), element.text, children
+
+
+def server_normalize_cfx(source: str) -> str:
+    """Return the conservative server-rewrite comparison representation.
+
+    Unlike :func:`canonicalize_cfx`, this function does not erase content,
+    structural wrappers, endpoint whitespace, or table presentation.
+    """
+
+    root = _parse_fragment_to_element(source)
+    root_text = None if root.text is not None and not root.text.strip() else root.text
+
+    def root_child(child: ET._Element) -> tuple[object, ...]:
+        value, tail = _preservation_child(child)
+        return value, None if tail is not None and not tail.strip() else tail
+
+    representation = (
+        root_text,
+        tuple(root_child(child) for child in root),
+    )
+    return json.dumps(representation, ensure_ascii=False, separators=(",", ":"))
+
+
+def preservation_signature(source: str) -> str:
+    """Hash every content/structure/presentation leaf required for safe edits."""
+
+    normalized = server_normalize_cfx(source).encode()
+    return f"sha256:{hashlib.sha256(normalized).hexdigest()}"
 
 
 def _is_cosmetic_style(style: str, tag: str) -> bool:
@@ -250,8 +348,7 @@ def _strip_volatile_and_cosmetic_attrs(root: ET._Element) -> None:
                 kept = [
                     c
                     for c in cls.split()
-                    if c not in cosmetic_class_values
-                    and not any(c.startswith(p) for p in cosmetic_class_prefixes)
+                    if c not in cosmetic_class_values and not any(c.startswith(p) for p in cosmetic_class_prefixes)
                 ]
                 if kept:
                     el.set("class", " ".join(kept))
@@ -358,30 +455,18 @@ def _promote_header_row_to_thead(root: ET._Element) -> None:
             continue
         # Already has a thead? Then don't second-guess.
         existing_thead = next(
-            (
-                child
-                for child in table
-                if isinstance(child.tag, str) and strip_ns(child.tag) == "thead"
-            ),
+            (child for child in table if isinstance(child.tag, str) and strip_ns(child.tag) == "thead"),
             None,
         )
         if existing_thead is not None:
             continue
         tbody = next(
-            (
-                child
-                for child in table
-                if isinstance(child.tag, str) and strip_ns(child.tag) == "tbody"
-            ),
+            (child for child in table if isinstance(child.tag, str) and strip_ns(child.tag) == "tbody"),
             None,
         )
         if tbody is None:
             continue
-        rows = [
-            c
-            for c in tbody
-            if isinstance(c.tag, str) and strip_ns(c.tag) == "tr"
-        ]
+        rows = [c for c in tbody if isinstance(c.tag, str) and strip_ns(c.tag) == "tr"]
         if not rows:
             continue
         first = rows[0]
@@ -415,11 +500,7 @@ def _unwrap_divs_in_cells(root: ET._Element) -> None:
         # Iteratively unwrap divs until none remain at the top of the
         # cell. (Nested divs flatten as we keep finding new ones.)
         while True:
-            divs = [
-                c
-                for c in cell
-                if isinstance(c.tag, str) and strip_ns(c.tag) == "div"
-            ]
+            divs = [c for c in cell if isinstance(c.tag, str) and strip_ns(c.tag) == "div"]
             if not divs:
                 break
             for div in divs:
@@ -441,15 +522,11 @@ def _flatten_paragraphs_in_table_cells(root: ET._Element) -> None:
         if strip_ns(cell.tag) not in ("td", "th"):
             continue
         children = list(cell)
-        if not any(
-            isinstance(c.tag, str) and strip_ns(c.tag) == "p" for c in children
-        ):
+        if not any(isinstance(c.tag, str) and strip_ns(c.tag) == "p" for c in children):
             continue
 
         new_text = cell.text if cell.text and cell.text.strip() else None
-        new_children, new_text = _flatten_cell_paragraph_children(
-            children, new_text
-        )
+        new_children, new_text = _flatten_cell_paragraph_children(children, new_text)
 
         for c in list(cell):
             cell.remove(c)
@@ -518,11 +595,7 @@ def _split_headings_at_break(root: ET._Element) -> None:
             continue
         children = list(heading)
         break_index = next(
-            (
-                i
-                for i, c in enumerate(children)
-                if isinstance(c.tag, str) and strip_ns(c.tag) == "br"
-            ),
+            (i for i, c in enumerate(children) if isinstance(c.tag, str) and strip_ns(c.tag) == "br"),
             -1,
         )
         if break_index < 0:
@@ -692,9 +765,7 @@ def _strip_empty_breaks(root: ET._Element) -> None:
             el.remove(child)
 
 
-_COSMETIC_CODE_PARAMS = frozenset(
-    {"linenumbers", "firstline", "collapse", "theme", "title"}
-)
+_COSMETIC_CODE_PARAMS = frozenset({"linenumbers", "firstline", "collapse", "theme", "title"})
 
 
 def _normalize_code_span_pipes(root: ET._Element) -> None:
@@ -1045,9 +1116,7 @@ _NORMALIZE_TEXT_TAGS = frozenset(
 )
 
 
-_TRIM_TAGS = frozenset(
-    {"td", "th", "h1", "h2", "h3", "h4", "h5", "h6", "p"}
-)
+_TRIM_TAGS = frozenset({"td", "th", "h1", "h2", "h3", "h4", "h5", "h6", "p"})
 
 
 def _trim_inline_endpoints(root: ET._Element) -> None:
@@ -1124,17 +1193,37 @@ def _is_inside_pre(element: ET._Element) -> bool:
 def _serialize_children(root: ET._Element) -> str:
     """Serialize the root's children into a single XML string.
 
-    Attribute order is normalized (lxml sorts with C14N output).
+    Attribute order is normalized for elements (lxml sorts with C14N output).
+    Comments and processing instructions are omitted from this comparison form,
+    but their tail text is retained.  Invoking C14N with one of those nodes as
+    the standalone root can crash libxml2, so they never enter that code path.
     """
 
     parts: list[str] = []
     for child in root:
-        raw = ET.tostring(
-            child,
-            method="c14n",
-            with_comments=False,
-        ).decode("utf-8")
+        if isinstance(child.tag, str):
+            raw = ET.tostring(
+                child,
+                method="c14n",
+                with_comments=False,
+            ).decode("utf-8")
+            raw += child.tail or ""
+        else:
+            raw = child.tail or ""
         # c14n re-emits xmlns declarations; strip them for readability.
+        raw = re.sub(r'\s+xmlns:ac="[^"]*"', "", raw)
+        raw = re.sub(r'\s+xmlns:ri="[^"]*"', "", raw)
+        raw = re.sub(r'\s+xmlns=""', "", raw)
+        parts.append(raw)
+    return "".join(parts)
+
+
+def _serialize_children_exact(root: ET._Element) -> str:
+    """Serialize a mutated fragment without dropping comments, PIs, or tails."""
+
+    parts: list[str] = []
+    for child in root:
+        raw = ET.tostring(child, method="xml", with_tail=True, encoding="unicode")
         raw = re.sub(r'\s+xmlns:ac="[^"]*"', "", raw)
         raw = re.sub(r'\s+xmlns:ri="[^"]*"', "", raw)
         raw = re.sub(r'\s+xmlns=""', "", raw)
@@ -1226,5 +1315,7 @@ __all__ = [
     "VOLATILE_ATTRS",
     "canonicalize_cfx",
     "normalize_md",
+    "preservation_signature",
+    "server_normalize_cfx",
     "strip_passthrough_comments",
 ]
