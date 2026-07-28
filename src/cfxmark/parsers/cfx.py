@@ -69,6 +69,7 @@ from cfxmark.exceptions import ParseError
 from cfxmark.macros import MacroRegistry, default_registry
 from cfxmark.opaque import opaque_id_for
 from cfxmark.presentation import DEFAULT_COLOR_CAPABILITIES, ColorCapabilityMatrix, parse_cell_background
+from cfxmark.storage_normalize import continues_plain_style_run
 from cfxmark.table_grid import MAX_TABLE_SPAN, TableGridError, TableGridOverlap, bounded_table_grid_layout
 from cfxmark.xml_ns import (
     AC_URI,
@@ -178,8 +179,12 @@ def _parse_fragment_to_element(source: str) -> ET._Element:
       file referenced from the document.
     * ``huge_tree=False`` rejects pathologically large parse trees.
 
-    Confluence's storage format is a fragment without a prologue, so
-    we can safely refuse anything that even mentions DOCTYPE/ENTITY.
+    The tree is returned verbatim. Adjacent-inline-run canonicalization
+    deliberately does *not* happen here: remote splice reuses subtrees of this
+    parse as exact storage bytes for untouched content, so merging wrappers at
+    this point would rewrite blocks the user never edited. The canonical form
+    belongs to the proof layer only — see :mod:`cfxmark.storage_normalize` and
+    ``extract_storage_source()``.
     """
 
     if _DOCTYPE_RE.search(source) or _ENTITY_DECL_RE.search(source):
@@ -383,15 +388,22 @@ def _parse_inline(
     """Walk an element that contains inline content and produce inline nodes."""
 
     nodes: list[InlineNode] = []
+    # Style nodes may only merge with the previous one when the *elements*
+    # form a plain run. The AST has no attributes, so this is the last point
+    # where an attributed or comment-separated wrapper can still be told apart.
+    unmergeable: set[int] = set()
+    previous_child: ET._Element | None = None
 
     if element.text:
         nodes.append(Text(content=element.text))
 
     for child in element:
+        produced_at = len(nodes)
         if not isinstance(child.tag, str):
             ctx.add_loss("XML comments and processing instructions are not represented in Markdown", child)
             if child.tail:
                 nodes.append(Text(content=child.tail))
+            previous_child = child
             continue
         tag = strip_ns(child.tag)
         ns = ns_of(child.tag)
@@ -401,6 +413,7 @@ def _parse_inline(
             nodes.extend(_parse_inline_span(child, ctx))
             if child.tail:
                 nodes.append(Text(content=child.tail))
+            previous_child = child
             continue
 
         if ns == AC_URI and tag == "structured-macro":
@@ -417,17 +430,34 @@ def _parse_inline(
             # whole paragraph to a block-level opaque.
             nodes.append(_make_inline_opaque(child, ctx))
 
+        if len(nodes) > produced_at and not continues_plain_style_run(previous_child, child):
+            unmergeable.add(produced_at)
+
         if child.tail:
             nodes.append(Text(content=child.tail))
+        previous_child = child
 
-    return _coalesce_adjacent_text(nodes)
+    return _coalesce_adjacent_text(nodes, unmergeable=frozenset(unmergeable))
 
 
-def _coalesce_adjacent_text(nodes: list[InlineNode]) -> tuple[InlineNode, ...]:
-    """Keep storage and Markdown parses on one semantic owner per visible inline run."""
+def _coalesce_adjacent_text(
+    nodes: list[InlineNode],
+    *,
+    unmergeable: frozenset[int] = frozenset(),
+) -> tuple[InlineNode, ...]:
+    """Keep storage and Markdown parses on one semantic owner per visible inline run.
+
+    The merged children are coalesced recursively, so a run collapses all the
+    way down to one ``Text``. Stopping at ``children=a + b`` would leave
+    ``Strong(Text("A"), Text("B"))`` where a Markdown parse of the very same
+    document yields ``Strong(Text("AB"))``: the two trees render identically
+    but no longer correspond node-for-node, and remote splice then fails to
+    recognize the block as untouched and rewrites storage the user never
+    edited.
+    """
 
     merged: list[InlineNode] = []
-    for node in nodes:
+    for index, node in enumerate(nodes):
         if merged and (
             (isinstance(node, Text) and isinstance(merged[-1], Text))
             or (isinstance(node, InlineCode) and isinstance(merged[-1], InlineCode))
@@ -436,10 +466,14 @@ def _coalesce_adjacent_text(nodes: list[InlineNode]) -> tuple[InlineNode, ...]:
             assert isinstance(previous, (Text, InlineCode))
             assert isinstance(node, (Text, InlineCode))
             merged[-1] = replace(previous, content=previous.content + node.content)
-        elif merged and isinstance(node, Strong) and isinstance(merged[-1], Strong):
+        elif merged and isinstance(node, Strong) and isinstance(merged[-1], Strong) and index not in unmergeable:
             previous_strong = merged[-1]
             assert isinstance(previous_strong, Strong)
-            merged[-1] = Strong(children=previous_strong.children + node.children)
+            merged[-1] = Strong(children=_coalesce_adjacent_text(list(previous_strong.children + node.children)))
+        elif merged and isinstance(node, Emphasis) and isinstance(merged[-1], Emphasis) and index not in unmergeable:
+            previous_emphasis = merged[-1]
+            assert isinstance(previous_emphasis, Emphasis)
+            merged[-1] = Emphasis(children=_coalesce_adjacent_text(list(previous_emphasis.children + node.children)))
         else:
             merged.append(node)
 

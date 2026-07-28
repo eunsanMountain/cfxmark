@@ -134,3 +134,63 @@ def test_internal_leaf_diff_types_are_not_public() -> None:
     # The two W1b public names ARE exported.
     assert "OwnershipProofError" in cfxmark.__all__
     assert "OwnershipProofSummary" in cfxmark.__all__
+
+
+def _table(tag: str) -> str:
+    return f"| h{tag} | v |\n| --- | --- |\n| c{tag} | 1 |\n"
+
+
+def _fatal_summary(markdown: str) -> OwnershipProofSummary:
+    storage = cfxmark.to_cfx_artifact(markdown).xhtml
+    base = dataclasses.replace(
+        cfxmark.to_md_artifact(storage, options=EDITABLE),
+        protected_regions=(),
+        remote_subtrees=(),
+    )
+    candidate = cfxmark.to_cfx_artifact(markdown, base_artifact=base, splice_source=storage, options=EDITABLE)
+    with pytest.raises(OwnershipProofError) as excinfo:
+        cfxmark.validate_managed_cfx_artifact(candidate, source_storage=storage, options=EDITABLE)
+    return excinfo.value.summary
+
+
+def test_table_presentation_failure_names_which_table() -> None:
+    """A table-presentation failure has to say which table it is about.
+
+    It is not leaf-based, so ``top_identities`` is empty for it — before this the
+    summary said a table could not be matched and nothing else, which on a page with
+    sixty tables is not an answer. The position is an integer in document order; the
+    table identity is derived from cell text and deliberately does not cross here.
+    """
+
+    summary = _fatal_summary("# T\n\n" + _table("a") + "\n" + _table("b") + "\n" + _table("b"))
+
+    assert summary.fatal_class == "table-presentation-ambiguous"
+    assert summary.top_identities == ()
+    # The two colliding tables, and not the distinct first one.
+    assert sorted(item.table_ordinal for item in summary.diagnostics) == [1, 2]
+
+
+def test_table_ordinal_is_none_when_no_single_table_is_at_fault() -> None:
+    """Failures that are about the document, not one table, must not invent a position."""
+
+    summary = _fatal_summary("# T\n\n" + _table("a") + "\n" + _table("a"))
+
+    assert all(item.table_ordinal is not None for item in summary.diagnostics)
+    # A non-table fatal keeps the field absent rather than defaulting to table 0.
+    candidate, source = _fatal_managed_candidate()
+    with pytest.raises(OwnershipProofError) as excinfo:
+        cfxmark.validate_managed_cfx_artifact(candidate, source_storage=source, options=EDITABLE)
+    assert all(item.table_ordinal is None for item in excinfo.value.summary.diagnostics)
+
+
+def test_diagnostic_summary_stays_value_free() -> None:
+    """Adding a position must not open a hole: only a code, a resolution, an int."""
+
+    summary = _fatal_summary("# T\n\n" + _table("SENTINEL") + "\n" + _table("SENTINEL"))
+
+    serialized = repr(dataclasses.asdict(summary))
+    assert "SENTINEL" not in serialized
+    for item in summary.diagnostics:
+        assert isinstance(item.code, str)
+        assert isinstance(item.resolution, str)
+        assert item.table_ordinal is None or isinstance(item.table_ordinal, int)

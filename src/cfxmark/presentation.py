@@ -248,6 +248,24 @@ def table_topology_hash(table: Table) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+# Cell fields that exist only on the storage side of the boundary, and so can never
+# be reproduced by a Markdown-parsed candidate. A table identity has to be computable
+# to the same value from both sides -- that is the whole point of it -- so including
+# a one-sided field guarantees the two sides disagree about a table that is in fact
+# the same table.
+#
+# ``background`` was already excluded for this reason. ``source_style`` is the same
+# kind of field: it is the raw storage ``style`` attribute, and the presentation
+# channel (``TableCellPresentation``) carries it separately, so nothing is lost by
+# keeping it out of the identity. Its *semantic* content -- alignment -- stays in the
+# identity as ``align``, which Markdown can express and therefore both sides have.
+#
+# Consequence to keep in mind: two tables identical except for a non-alignment inline
+# cell style now share an identity and are reported ambiguous. That direction is safe
+# -- an ambiguous identity refuses the edit; it never picks one and writes.
+_STORAGE_ONLY_CELL_FIELDS = frozenset({"background", "source_style"})
+
+
 def _table_base_id(table: Table) -> tuple[str, str]:
     topology_hash = table_topology_hash(table)
     rows = ((table.header,) if table.header is not None else ()) + table.body
@@ -261,7 +279,7 @@ def _table_base_id(table: Table) -> tuple[str, str]:
                 "fields": {
                     dataclass_field.name: identity_payload(getattr(value, dataclass_field.name))
                     for dataclass_field in fields(value)
-                    if dataclass_field.name != "background"
+                    if dataclass_field.name not in _STORAGE_ONLY_CELL_FIELDS
                 },
             }
         if isinstance(value, tuple):
@@ -403,31 +421,63 @@ def presentation_cell_occurrences(document: Document) -> dict[int, str]:
     return occurrences
 
 
+AMBIGUOUS_IDENTITY = "table presentation identity is ambiguous"
+TOPOLOGY_CHANGED = "table presentation topology changed"
+STYLE_EDIT_UNSUPPORTED = "table presentation edit is not supported"
+AMBIGUOUS_OR_MISSING = "table presentation is ambiguous or missing"
+
+
+@dataclass(frozen=True)
+class PresentationDiagnostic:
+    """A presentation-matching failure and, where known, the table it concerns.
+
+    ``table_ordinal`` is a position in document order, never an identity — the
+    identity is derived from cell text and must not cross an error boundary. It is
+    ``None`` when the failure is about the document as a whole (a table-count change)
+    or about a set of tables that could not be told apart.
+    """
+
+    message: str
+    table_ordinal: int | None = None
+
+
+def _ordinal_of(artifact: PresentationArtifact, table_id: str) -> int | None:
+    for index, table in enumerate(artifact.tables):
+        if table.table_id == table_id:
+            return index
+    return None
+
+
 def apply_presentation_with_authority(
     document: Document,
     artifact: PresentationArtifact,
-) -> tuple[Document, tuple[str, ...], dict[int, str]]:
+) -> tuple[Document, tuple[PresentationDiagnostic, ...], dict[int, str]]:
     """Apply presentation while retaining pulled table/cell authority IDs."""
 
-    diagnostics: list[str] = ["table presentation identity is ambiguous"] if artifact.ambiguous_table_ids else []
+    diagnostics: list[PresentationDiagnostic] = [
+        PresentationDiagnostic(AMBIGUOUS_IDENTITY, _ordinal_of(artifact, table_id))
+        for table_id in artifact.ambiguous_table_ids
+    ]
     candidate_tables = _iter_tables(document)
     if artifact.tables:
         if len(candidate_tables) != len(artifact.tables):
-            diagnostics.append("table presentation topology changed")
+            diagnostics.append(PresentationDiagnostic(TOPOLOGY_CHANGED))
         else:
             normalized_by_object: dict[int, Table] = {}
-            for candidate, authority in zip(candidate_tables, artifact.tables, strict=True):
+            for authority_ordinal, (candidate, authority) in enumerate(
+                zip(candidate_tables, artifact.tables, strict=True)
+            ):
                 if authority.header_present:
                     normalized_by_object[id(candidate)] = candidate
                     continue
                 header = candidate.header
                 if header is None or any(cell.children for cell in header.cells):
-                    diagnostics.append("table presentation topology changed")
+                    diagnostics.append(PresentationDiagnostic(TOPOLOGY_CHANGED, authority_ordinal))
                     normalized_by_object[id(candidate)] = candidate
                     continue
                 normalized = replace(candidate, header=None)
                 if table_topology_hash(normalized) != authority.topology_hash:
-                    diagnostics.append("table presentation topology changed")
+                    diagnostics.append(PresentationDiagnostic(TOPOLOGY_CHANGED, authority_ordinal))
                     normalized_by_object[id(candidate)] = candidate
                     continue
                 normalized_by_object[id(candidate)] = normalized
@@ -478,7 +528,8 @@ def apply_presentation_with_authority(
             expected_by_ordinal[ordinal] = expected
             unmatched_ordinals.remove(ordinal)
         elif len(exact) > 1:
-            diagnostics.append("table presentation identity is ambiguous")
+            # Several candidates match one authority table; no single position to name.
+            diagnostics.append(PresentationDiagnostic(AMBIGUOUS_IDENTITY, _ordinal_of(artifact, table_id)))
 
     for table_id, expected in by_table.items():
         if any(item.table_id == table_id for items in expected_by_ordinal.values() for item in items):
@@ -494,7 +545,7 @@ def apply_presentation_with_authority(
             expected_by_ordinal[ordinal] = expected
             unmatched_ordinals.remove(ordinal)
         else:
-            diagnostics.append("table presentation identity is ambiguous")
+            diagnostics.append(PresentationDiagnostic(AMBIGUOUS_IDENTITY, _ordinal_of(artifact, table_id)))
 
     def rewrite(current: Any) -> Any:
         nonlocal table_ordinal
@@ -505,10 +556,10 @@ def apply_presentation_with_authority(
             expected = expected_by_ordinal.get(ordinal, [])
             authority = artifact.tables[ordinal] if ordinal < len(artifact.tables) else None
             if ambiguous:
-                diagnostics.append("table presentation identity is ambiguous")
+                diagnostics.append(PresentationDiagnostic(AMBIGUOUS_IDENTITY, ordinal))
                 return current
             if expected and any(item.topology_hash != topology_hash for item in expected):
-                diagnostics.append("table presentation topology changed")
+                diagnostics.append(PresentationDiagnostic(TOPOLOGY_CHANGED, ordinal))
                 return current
             replacements = {(item.anchor_row_index, item.anchor_column_index): item for item in expected}
             rows = ((current.header,) if current.header is not None else ()) + current.body
@@ -529,7 +580,7 @@ def apply_presentation_with_authority(
                                 authority is not None and authority.mixed_alignment and cell.align == CellAlign.NONE
                             )
                         ):
-                            diagnostics.append("table presentation edit is not supported")
+                            diagnostics.append(PresentationDiagnostic(STYLE_EDIT_UNSUPPORTED, ordinal))
                         used.add((item.table_id, *anchor))
                         cell = replace(
                             cell,
@@ -579,13 +630,22 @@ def apply_presentation_with_authority(
             )
     expected_keys = {(item.table_id, item.anchor_row_index, item.anchor_column_index) for item in artifact.cells}
     if expected_keys != used:
-        diagnostics.append("table presentation is ambiguous or missing")
+        # Name every table whose stored presentation found no home — this is the
+        # failure an operator actually meets, and "somewhere in this page" is not
+        # an answer when the page has sixty tables.
+        unplaced = {table_id for table_id, _row, _column in expected_keys - used}
+        diagnostics.extend(
+            PresentationDiagnostic(AMBIGUOUS_OR_MISSING, _ordinal_of(artifact, table_id))
+            for table_id in sorted(unplaced)
+        )
+        if not unplaced:
+            diagnostics.append(PresentationDiagnostic(AMBIGUOUS_OR_MISSING))
     return updated_document, tuple(dict.fromkeys(diagnostics)), authority_by_object
 
 
 def apply_presentation(document: Document, artifact: PresentationArtifact) -> tuple[Document, tuple[str, ...]]:
     updated, diagnostics, _authority = apply_presentation_with_authority(document, artifact)
-    return updated, diagnostics
+    return updated, tuple(item.message for item in diagnostics)
 
 
 __all__ = [
@@ -597,6 +657,7 @@ __all__ = [
     "TableCellPresentation",
     "TableTopologyAuthority",
     "apply_presentation",
+    "PresentationDiagnostic",
     "apply_presentation_with_authority",
     "extract_presentation",
     "parse_cell_background",

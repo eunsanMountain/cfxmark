@@ -30,6 +30,10 @@ class DiagnosticLocation:
     heading_path: tuple[str, ...] = field(default_factory=tuple)
     table_row: int | None = None
     table_column: int | None = None
+    # Which table, in document order. An integer position cannot carry content, so
+    # it stays safe to surface across a public error boundary — unlike the table id,
+    # which is derived from cell text.
+    table_index: int | None = None
 
 
 @dataclass(frozen=True)

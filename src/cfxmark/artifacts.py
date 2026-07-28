@@ -755,15 +755,20 @@ def _ownership_proof_summary(
     top_identities = tuple(sorted(ordered_identities)[:_MAX_SUMMARY_IDENTITIES])
 
     diagnostic_summaries: list[DiagnosticSummary] = []
-    seen_diagnostics: set[tuple[str, str]] = set()
+    seen_diagnostics: set[tuple[str, str, int | None]] = set()
     for diagnostic in diagnostics:
         if not diagnostic.blocking:
             continue
         resolution = diagnostic.resolutions[0].id if diagnostic.resolutions else ""
-        key = (diagnostic.code, resolution)
+        table_ordinal = diagnostic.location.table_index
+        # Dedup includes the position: two tables failing the same way are two
+        # things to look at, and collapsing them hides the second one.
+        key = (diagnostic.code, resolution, table_ordinal)
         if key not in seen_diagnostics:
             seen_diagnostics.add(key)
-            diagnostic_summaries.append(DiagnosticSummary(code=diagnostic.code, resolution=resolution))
+            diagnostic_summaries.append(
+                DiagnosticSummary(code=diagnostic.code, resolution=resolution, table_ordinal=table_ordinal)
+            )
 
     return OwnershipProofSummary(
         fatal_class=proof.blocking_code or "fatal",

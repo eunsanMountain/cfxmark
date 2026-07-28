@@ -535,7 +535,10 @@ def test_publish_preflight_requires_exact_fresh_source_and_five_hashes() -> None
     assert proof.artifacts.edited_markdown_sha256 == "sha256:" + hashlib.sha256(edited.encode()).hexdigest()
     assert proof.artifacts.final_candidate_sha256 == "sha256:" + hashlib.sha256(candidate.xhtml.encode()).hexdigest()
     assert proof.artifacts.baseline_candidate_sha256 == "sha256:" + hashlib.sha256(baseline.xhtml.encode()).hexdigest()
-    assert proof.artifacts.converter == "cfxmark/0.5.0"
+    # Derived, not pinned: a release must not need a test edit here, and a
+    # stale literal turns every bump into a failure that has to be dismissed
+    # by hand — with whatever real regression is hiding behind it.
+    assert proof.artifacts.converter == f"cfxmark/{cfxmark.__version__}"
     assert proof.artifacts.profile == "editable"
 
 

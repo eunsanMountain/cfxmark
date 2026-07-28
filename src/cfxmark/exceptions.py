@@ -77,6 +77,10 @@ class DiagnosticSummary:
 
     code: str
     resolution: str
+    # Zero-based table position for a table-presentation failure, else ``None``.
+    # "which table" is the one thing a caller needs and could not previously get:
+    # these failures are not leaf-based, so ``top_identities`` is empty for them.
+    table_ordinal: int | None = None
 
 
 @dataclass(frozen=True)

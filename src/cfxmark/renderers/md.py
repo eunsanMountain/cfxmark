@@ -21,6 +21,7 @@ one normalization pass regardless of the shape of ``m``.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Literal
 
@@ -160,16 +161,27 @@ def _render_inline_text(
 def _coalesce_adjacent_styles(
     nodes: tuple[InlineNode, ...],
 ) -> tuple[InlineNode, ...]:
-    """Merge adjacent identical inline styles into one canonical run."""
+    """Merge adjacent identical inline styles into one canonical run.
+
+    Markdown has no way to spell two adjacent style runs: ``*A**B*``
+    re-parses as one ``<em>`` whose text carries a literal ``**``. An
+    uninterrupted run is therefore rendered as a single span. A separator
+    (even one space) is a real boundary and keeps the runs apart, because
+    it lands in its own ``Text`` node and breaks the adjacency test below.
+    """
 
     merged: list[InlineNode] = []
     for node in nodes:
-        if isinstance(node, Strong) and not node.children:
+        if isinstance(node, (Strong, Emphasis)) and not node.children:
             continue
         if isinstance(node, Strong) and merged and isinstance(merged[-1], Strong):
             previous = merged[-1]
             assert isinstance(previous, Strong)
             merged[-1] = Strong(children=previous.children + node.children)
+        elif isinstance(node, Emphasis) and merged and isinstance(merged[-1], Emphasis):
+            previous_emphasis = merged[-1]
+            assert isinstance(previous_emphasis, Emphasis)
+            merged[-1] = Emphasis(children=previous_emphasis.children + node.children)
         elif isinstance(node, ColorSpan) and merged and isinstance(merged[-1], ColorSpan):
             previous_color = merged[-1]
             assert isinstance(previous_color, ColorSpan)
@@ -214,45 +226,103 @@ def _first_char_of_node(node: InlineNode) -> str:
 
 
 def _is_word_char(ch: str) -> bool:
-    """True if ``ch`` is a Unicode word character (letters or digits).
-
-    CommonMark's emphasis rules block closing (or opening) a delimiter
-    run when it is flanked on both sides by "word" characters — this
-    matters especially for CJK, where Korean / Chinese / Japanese
-    characters are all word characters that defeat the usual ``**X**``
-    intra-word emphasis.
-    """
+    """True if ``ch`` is a Unicode word character (letters or digits)."""
 
     if not ch:
         return False
     return ch.isalnum()
 
 
-def _needs_html_fallback(
+# CommonMark 0.30 *ASCII punctuation*. Kept explicit rather than derived from
+# Unicode categories: several of these (``$ + < = > ^ ` | ~``) are categorized
+# ``S*``, not ``P*``, yet the spec counts them as punctuation.
+_ASCII_PUNCT = frozenset("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
+
+
+def _is_md_punct(ch: str) -> bool:
+    """CommonMark's *Unicode punctuation character* (spec 0.30).
+
+    This targets the locked mistletoe 1.5.1 parser, whose punctuation table
+    cites CommonMark 0.30: ASCII punctuation plus Unicode general category
+    ``P*``. CommonMark 0.31.2 widens this to ``P*`` **or** ``S*``, which is
+    *not* what the pinned parser does — so a symbol such as ``★``, ``°``,
+    ``€``, or an emoji is deliberately not punctuation here. Upgrading
+    mistletoe requires re-running the flanking property oracle.
+    """
+
+    if not ch:
+        return False
+    return ch in _ASCII_PUNCT or unicodedata.category(ch).startswith("P")
+
+
+def _is_md_space(ch: str) -> bool:
+    """CommonMark's *Unicode whitespace character* (includes category ``Zs``)."""
+
+    if not ch:
+        return False
+    return ch.isspace() or unicodedata.category(ch) == "Zs"
+
+
+def _blocks_asterisk_flanking(outside: str, inside: str) -> bool:
+    """Whether an asterisk delimiter run fails to flank across one boundary.
+
+    A run flanks unless the character just inside it is punctuation while the
+    character just outside is neither whitespace nor punctuation. An absent
+    outside character (start / end of the containing text) counts as
+    whitespace, so it never blocks.
+    """
+
+    return _is_md_punct(inside) and bool(outside) and not (_is_md_space(outside) or _is_md_punct(outside))
+
+
+def _needs_asterisk_fallback(
     inner: str,
     prev_char: str,
     next_char: str,
 ) -> bool:
-    """Detect when emphasis delimiters would not be re-parsed correctly.
+    """Detect when ``*`` / ``**`` would not be re-parsed as emphasis.
 
-    The CommonMark rules for flanking delimiter runs are subtle, but
-    the failure mode we actually care about is intraword emphasis
-    where the inside of the delimiter touches punctuation. A simple
-    conservative test: if the outside is a word char on either side
-    and the adjacent inside character is punctuation, fall back.
+    An asterisk opener only has to be left-flanking and a closer only has to
+    be right-flanking; the extra "must not also flank the other way" clause
+    applies to ``_`` / ``__``. Asterisk emphasis therefore survives intraword
+    adjacency — ``**볼드**이다`` and ``**bold**text`` both re-parse — and
+    breaks only at a boundary where :func:`_blocks_asterisk_flanking` holds.
+
+    The two boundaries are evaluated independently: the opener pairs
+    ``prev_char`` with the first inside character, the closer pairs the last
+    inside character with ``next_char``.
     """
 
     if not inner:
         return False
     inside_first = inner[0]
     inside_last = inner[-1]
-    # Empty / whitespace boundaries — plain markdown works.
+    # Boundary whitespace is hoisted out of the delimiters before this call.
     if not inside_first.strip() or not inside_last.strip():
         return False
-    # Word char outside with punctuation adjacent inside — problem.
-    if _is_word_char(prev_char) or _is_word_char(next_char):
-        return True
-    return False
+    return _blocks_asterisk_flanking(prev_char, inside_first) or _blocks_asterisk_flanking(next_char, inside_last)
+
+
+def _needs_strikethrough_fallback(
+    inner: str,
+    prev_char: str,
+    next_char: str,
+) -> bool:
+    """Detect when ``~~`` would not be re-parsed as a strikethrough.
+
+    ``~~`` is not a CommonMark construct and the pinned parser does not run it
+    through the flanking rules at all — mistletoe 1.5.1 matches it with the
+    regex ``(?<!\\\\)(?:\\\\\\\\)*~~(.+?)~~``. It therefore keeps its own
+    conservative word-boundary contract instead of sharing the asterisk
+    predicate; routing ``~~`` through the asterisk rules would emit ``<del>``
+    where ``~~`` works and drop it where ``~~`` does not.
+    """
+
+    if not inner:
+        return False
+    if not inner[0].strip() or not inner[-1].strip():
+        return False
+    return _is_word_char(prev_char) or _is_word_char(next_char)
 
 
 def _render_inline_node(
@@ -274,7 +344,7 @@ def _render_inline_node(
         leading, core, trailing = _split_boundary_whitespace(inner)
         if not core:
             return inner
-        if _needs_html_fallback(
+        if _needs_asterisk_fallback(
             core,
             leading[-1:] or prev_char,
             trailing[:1] or next_char,
@@ -287,7 +357,7 @@ def _render_inline_node(
         leading, core, trailing = _split_boundary_whitespace(inner)
         if not core:
             return inner
-        if _needs_html_fallback(
+        if _needs_asterisk_fallback(
             core,
             leading[-1:] or prev_char,
             trailing[:1] or next_char,
@@ -299,7 +369,7 @@ def _render_inline_node(
         leading, core, trailing = _split_boundary_whitespace(inner)
         if not core:
             return inner
-        if _needs_html_fallback(
+        if _needs_strikethrough_fallback(
             core,
             leading[-1:] or prev_char,
             trailing[:1] or next_char,

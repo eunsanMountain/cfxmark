@@ -11,6 +11,15 @@ import pytest
 _RELEASE_WORKFLOW = Path(__file__).parents[2] / ".github" / "workflows" / "release.yml"
 _VERSION_GUARD = Path(__file__).parents[2] / ".github" / "scripts" / "check_pypi_version_absent.py"
 
+# These assert how *this repository* publishes, and `.github/` is deliberately not
+# shipped in the sdist. Running the shipped tests against an installed wheel is a
+# real check — it is how we verify a release candidate — so these must step aside
+# there instead of failing and burying whatever else that run would have caught.
+pytestmark = pytest.mark.skipif(
+    not (_RELEASE_WORKFLOW.exists() and _VERSION_GUARD.exists()),
+    reason="release workflow files are repository-only; not present in a distribution",
+)
+
 
 class _Response:
     def __init__(self, status: int) -> None:

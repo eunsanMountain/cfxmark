@@ -1128,7 +1128,11 @@ def test_empty_paragraph_and_jira_macro_identity_survive_unrelated_edit() -> Non
     assert candidate.xhtml.endswith("<p>Edited</p>")
 
 
-def test_html_strong_fallback_coalesces_text_for_source_map_identity() -> None:
+def test_strong_before_korean_particle_keeps_source_map_identity() -> None:
+    # A Korean particle directly after the closing delimiter used to force raw
+    # ``<strong>`` HTML. Asterisks re-parse fine there, so the Markdown is now
+    # delimited — the point of this test is that the source-map identity and
+    # the exact candidate XHTML survive either spelling.
     storage = "<p>Scope <strong>motion_state migration</strong>이다.</p><p>After</p>"
     base = cfxmark.to_md_artifact(storage, options=EDITABLE)
     candidate = cfxmark.to_cfx_artifact(
@@ -1138,7 +1142,7 @@ def test_html_strong_fallback_coalesces_text_for_source_map_identity() -> None:
         options=EDITABLE,
     )
 
-    assert r"<strong>motion\_state migration</strong>이다." in base.markdown
+    assert r"**motion\_state migration**이다." in base.markdown
     assert base.status == "ready_to_edit"
     assert candidate.push_safe is True
     assert candidate.xhtml == "<p>Scope <strong>motion_state migration</strong>이다.</p><p>Edited</p>"

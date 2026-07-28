@@ -7,6 +7,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-07-28
+
+Editable-Markdown repairs. Three classes of ordinary page become editable that
+were not before, and one storage-comparison hole is closed.
+
+**Managed files must be re-pulled.** The manifest binds the converter that
+produced it, so an existing managed Markdown file fails with
+`managed_converter_mismatch` until `pull-md` is run again, and pending consent
+fingerprints are invalidated for the same reason. That is the designed effect of
+a converter change, not a defect.
+
+### Fixed
+
+- **A table's identity is no longer computed from a storage-only field.** A page
+  could not be edited at all when it held two tables of the same shape and at
+  least one used Markdown column alignment. `_table_base_id()` hashed every cell
+  field except `background`, which included `source_style` — the raw storage
+  `style` attribute. A Markdown-parsed candidate can never carry that field, so
+  the two sides of the boundary disagreed about a table that is in fact the same
+  table, the identity match failed, the topology fallback found two equally good
+  candidates, and the proof went fatal with `table-presentation-ambiguous`.
+  Alignment is ordinary Markdown, so this reached ordinary documents, including
+  for a no-op round trip.
+
+  `align` — the same information in a form Markdown can express — stays in the
+  identity, so tables that differ only by alignment are still told apart. Two
+  tables identical apart from a *non-alignment* inline cell style now share an
+  identity and are reported ambiguous; that direction refuses the edit and can
+  never silently pick one.
+
+- **Adjacent emphasis no longer injects literal asterisks.**
+  `<em>A</em><em>B</em>` rendered as `*A**B*`, which reparsed to
+  `<em>A**B</em>` — content corruption, not a formatting difference. Adjacent
+  `Emphasis` runs are now merged the way adjacent `Strong` runs already were.
+
+- **`**bold**` followed by a word character is no longer escaped into raw HTML.**
+  The fallback guarding CommonMark's flanking rules tested only whether the
+  *outside* character was alphanumeric, which is neither the rule nor what its
+  own docstring described. `**bold**text` reparses correctly, so the fallback was
+  unnecessary; Korean is affected on nearly every bold span because a particle
+  follows the closing delimiter. The predicate now pairs each side with the
+  adjacent inside character and classifies punctuation and whitespace by Unicode
+  category, so Symbol boundaries (`★`, `°`, `€`, emoji) — which `isalnum()`
+  misses — are handled correctly. Applies to `*` and `**` only; `~~` keeps its
+  existing behavior.
+
+- **An adjacent plain `<strong>` or `<em>` run is one semantic owner**, so a page
+  carrying one is no longer stuck at `needs_migration`. Storage-source extraction
+  canonicalizes an eligible run, and the parser coalesces a merged run's children
+  down to one `Text` node so the tree corresponds node-for-node with a Markdown
+  parse of the same document — without which remote splice does not recognize an
+  untouched block and rewrites storage the user never edited. Eligibility is
+  decided while the elements are still available, so an attributed or aliased
+  wrapper is never absorbed after its tag information is gone.
+
+- **Tags in different XML namespaces no longer compare equal.**
+  `storage_semantically_equal()` matched on local name, so `{urn:x}strong` and
+  `{urn:y}strong` collapsed into one run and an element could disappear while
+  comparison still reported equality. Adjacent-run canonicalization now accepts
+  namespace-free `strong`/`em` only. Inline `code` keeps its existing local-name
+  matching.
+
+### Added
+
+- `DiagnosticSummary.table_ordinal` and `DiagnosticLocation.table_index` carry
+  the position of the table a presentation failure concerns. These failures are
+  not leaf-based, so `top_identities` is empty for them and the summary
+  previously named no table at all. The value is a position in document order,
+  never the table identity, which is derived from cell text and does not cross a
+  public error boundary. Summary de-duplication includes it, so two tables
+  failing the same way are reported as two.
+
+### Changed
+
+- An adjacent run carrying an attribute or an interleaved comment is now a named,
+  consent-gated loss (`element-attribute-omitted`, `xml-comment-dropped`) instead
+  of failing closed as `unclassified-storage-change`. Publishing it requires
+  explicit consent, as with any reported loss. Nested children, mixed
+  `<b>`/`<strong>` aliases, and separated wrappers still fail closed.
+
+
 ## [0.5.0] — 2026-07-24
 
 ### Known limitations

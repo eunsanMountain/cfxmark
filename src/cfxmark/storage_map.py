@@ -12,7 +12,8 @@ import lxml.etree as ET
 from cfxmark.parsers.cfx import _parse_fragment_to_element
 from cfxmark.presentation import parse_color
 from cfxmark.source_map import SourceKind, SourceMapEntry, StorageLeafField, StorageLeafRef, fingerprint_semantic_value
-from cfxmark.xml_ns import storage_node_name, storage_qualified_name, strip_ns
+from cfxmark.storage_normalize import coalesce_adjacent_inline_runs
+from cfxmark.xml_ns import storage_node_name, storage_qualified_name
 
 _TABLE_CELL_STYLE_PROPERTIES = frozenset({"background-color", "text-align"})
 _STYLE_PROPERTY_NAME_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9-]*\Z")
@@ -272,46 +273,18 @@ def extract_storage(
     return StorageExtraction(tuple(leaves), entries, tuple(unmapped), tuple(ambiguous))
 
 
-def _coalesce_adjacent_inline_code(root: ET._Element) -> ET._Element:
-    """Merge adjacent inline ``<code>`` runs that have no separator between them.
+def extract_storage_source(source: str) -> StorageExtraction:
+    """Extract proof leaves from a storage fragment.
 
-    Markdown cannot represent two adjacent inline code spans without a
-    separator (`` `a``b` `` re-parses as one span ``a``b``), so a managed
-    round-trip coalesces ``<code>a</code><code>b</code>`` into
-    ``<code>ab</code>``. The rendered code text is identical; only the internal
-    span boundary -- which the managed Markdown format cannot maintain -- is
-    lost. Canonicalizing it here (like the entity/whitespace normalization XML
-    parsing already erases) keeps the ownership proof from reporting a
-    boundary-only difference as a real change.
+    Adjacent inline runs that Markdown cannot spell (inline code, ``strong``,
+    ``em``) are canonicalized first, so a wrapper boundary the managed format
+    cannot carry is not reported as a content change. This is the *only* place
+    that canonical form is applied: the parse tree itself stays verbatim so
+    remote splice can still reuse untouched blocks byte-for-byte. See
+    :mod:`cfxmark.storage_normalize`.
     """
 
-    for parent in root.iter():
-        if not isinstance(parent.tag, str):
-            continue
-        run_start: ET._Element | None = None
-        for child in list(parent):
-            # "plain" means a text-only <code> with no children AND no attributes:
-            # the storage extractor treats attributes as their own proof leaves, so
-            # merging an attributed span would silently drop one. Only attribute-free
-            # adjacent runs are a genuine serialization equivalence.
-            is_plain_code = (
-                isinstance(child.tag, str) and strip_ns(child.tag) == "code" and len(child) == 0 and not child.attrib
-            )
-            if (
-                run_start is not None
-                and is_plain_code
-                and not run_start.tail  # truly adjacent: nothing (not even whitespace) between them
-            ):
-                run_start.text = (run_start.text or "") + (child.text or "")
-                run_start.tail = child.tail
-                parent.remove(child)
-                continue
-            run_start = child if is_plain_code else None
-    return root
-
-
-def extract_storage_source(source: str) -> StorageExtraction:
-    return extract_storage(_coalesce_adjacent_inline_code(_parse_fragment_to_element(source)))
+    return extract_storage(coalesce_adjacent_inline_runs(_parse_fragment_to_element(source)))
 
 
 __all__ = [

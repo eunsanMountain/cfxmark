@@ -70,6 +70,8 @@ from cfxmark.parsers.jira_wiki import parse_jira_wiki
 from cfxmark.parsers.md import parse_md
 from cfxmark.presentation import (
     DEFAULT_COLOR_CAPABILITIES,
+    STYLE_EDIT_UNSUPPORTED,
+    TOPOLOGY_CHANGED,
     ColorCapabilityMatrix,
     PresentationArtifact,
     TableCellAddress,
@@ -1941,19 +1943,25 @@ def _to_cfx_artifact_core(
         render_presentation,
     )
     diagnostics.extend(_attachment_url_diagnostics(document, source_fingerprint=source_fingerprint))
-    for ordinal, message in enumerate(presentation_messages):
-        if "edit is not supported" in message:
+    for ordinal, presentation_item in enumerate(presentation_messages):
+        if presentation_item.message == STYLE_EDIT_UNSUPPORTED:
             code = "table-style-edit-not-supported"
+        elif presentation_item.message == TOPOLOGY_CHANGED:
+            code = "table-topology-changed"
         else:
-            code = "table-topology-changed" if "topology" in message else "table-presentation-ambiguous"
+            code = "table-presentation-ambiguous"
         diagnostics.append(
             make_diagnostic(
                 code=code,
                 category="presentation_loss",
                 severity="blocking",
-                message=message,
+                message=presentation_item.message,
                 source_fingerprint=source_fingerprint,
                 ordinal=ordinal,
+                location=DiagnosticLocation(
+                    semantic_path=(f"source[{ordinal}]",),
+                    table_index=presentation_item.table_ordinal,
+                ),
             )
         )
     if base_artifact is None or splice_source is None:
