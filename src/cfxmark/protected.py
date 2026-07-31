@@ -137,6 +137,13 @@ def build_protected_regions(
     return tuple(regions)
 
 
+def _has_ragged_rows(table: Table) -> bool:
+    """Return whether GFM rectangularisation would change row topology."""
+
+    rows = (*((table.header,) if table.header is not None else ()), *table.body)
+    return len({len(row.cells) for row in rows}) > 1
+
+
 def build_table_island_regions(
     document: Document,
     markdown: str,
@@ -155,7 +162,9 @@ def build_table_island_regions(
         if not isinstance(block, Table) or not block.source_path:
             continue
         subtree = subtrees_by_path.get(block.source_path)
-        if subtree is None or not subtree.requires_fresh_source:
+        if subtree is None:
+            continue
+        if not subtree.requires_fresh_source and not _has_ragged_rows(block):
             continue
         markdown_range = subtree.base_markdown_range
         projection = markdown[markdown_range.start : markdown_range.end]

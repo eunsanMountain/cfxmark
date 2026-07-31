@@ -73,6 +73,13 @@ def test_link() -> None:
     )
 
 
+def test_anchor_without_href_does_not_gain_empty_href() -> None:
+    assert_md_to_cfx(
+        "<a>file:line</a>",
+        "<p><a>file:line</a></p>",
+    )
+
+
 def test_image_url() -> None:
     assert_md_to_cfx(
         "![alt](https://example.com/img.png)",

@@ -81,35 +81,6 @@ class OwnedChange:
 
 
 @dataclass(frozen=True)
-class SupersessionWitness:
-    """Proof that a would-be migration/user overlap is a superseded structural shift.
-
-    A leaf that both a migration occurrence and a user operation change is normally
-    fatal: the report cannot say which decision produced the final value. For a
-    derived *positional* leaf (``field == "topology"``) the two can instead be a
-    disclosed composition -- the migration reshaped a node into C0, and a user
-    structural operation then removed that exact C0 node. This tuple records the
-    mechanical binding so both the prover and the independent validator re-derive
-    it identically and compare byte for byte:
-
-        migration created the C0 node whose leaf is ``c0_intermediate_fingerprint``;
-        the user operation ``user_operation_id`` removed that same C0 leaf via a
-        ``tombstone_kind`` tombstone; nothing else owns the final leaf.
-
-    Only then does the overlap dissolve to a user-owned intended change. A missing
-    or non-unique witness leaves the leaf fatal.
-    """
-
-    final_leaf: LeafIdentity
-    before_fingerprint: str | None
-    after_fingerprint: str | None
-    migration_occurrence_id: str
-    c0_intermediate_fingerprint: str
-    user_operation_id: str
-    tombstone_kind: str
-
-
-@dataclass(frozen=True)
 class OwnershipResult:
     artifacts: ChangeArtifacts
     source_leaves: tuple[LeafSnapshot, ...] = ()
@@ -119,7 +90,6 @@ class OwnershipResult:
     unclassified: tuple[LeafChange, ...] = ()
     multiple_owners: tuple[LeafChange, ...] = ()
     overlapping: tuple[LeafChange, ...] = ()
-    supersession_witnesses: tuple[SupersessionWitness, ...] = ()
     fatal_diagnostic_codes: tuple[str, ...] = ()
     preserved_count: int = field(default=0)
 
@@ -144,18 +114,6 @@ class OwnershipResult:
                 "value_fingerprint": snapshot.value_fingerprint,
             }
 
-        def witness_document(witness: SupersessionWitness) -> dict[str, object]:
-            semantic_path, field_name, attribute_name, ordinal = witness.final_leaf
-            return {
-                "final_leaf": [list(semantic_path), field_name, attribute_name, ordinal],
-                "before_fingerprint": witness.before_fingerprint,
-                "after_fingerprint": witness.after_fingerprint,
-                "migration_occurrence_id": witness.migration_occurrence_id,
-                "c0_intermediate_fingerprint": witness.c0_intermediate_fingerprint,
-                "user_operation_id": witness.user_operation_id,
-                "tombstone_kind": witness.tombstone_kind,
-            }
-
         return json.dumps(
             {
                 "artifacts": {
@@ -175,7 +133,6 @@ class OwnershipResult:
                 "unclassified": [change_document(change) for change in self.unclassified],
                 "multiple_owners": [change_document(change) for change in self.multiple_owners],
                 "overlapping": [change_document(change) for change in self.overlapping],
-                "supersession_witnesses": [witness_document(witness) for witness in self.supersession_witnesses],
                 "fatal_diagnostic_codes": list(self.fatal_diagnostic_codes),
                 "preserved_count": self.preserved_count,
             },
@@ -324,6 +281,5 @@ __all__ = [
     "LeafSnapshot",
     "OwnedChange",
     "OwnershipResult",
-    "SupersessionWitness",
     "classify_changes",
 ]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 import cfxmark
+from cfxmark import source_map
 from cfxmark.source_map import (
     EditOperation,
     SemanticMappingAmbiguous,
@@ -663,3 +664,202 @@ def test_managed_paragraph_tie_beside_opaque_macro_preserves_bytes() -> None:
     assert proof.unclassified == ()
     assert raw_macro in candidate.xhtml  # opaque subtree byte-preserved
     assert candidate.preserved_subtrees or candidate.preserved_regions
+
+
+# ---------------------------------------------------------------------------
+# A tie is local. What it must not take with it is the rest of the document.
+# ---------------------------------------------------------------------------
+
+
+def test_a_tie_still_raises_but_carries_the_proof_it_did_finish() -> None:
+    """Measured across the Story corpus: discarding the whole walk over one tie
+    left thousands of leaves unattributed -- 2,298 on one page, 863 on another,
+    from an ambiguity inside a single table. On the page that prompted this, the
+    count went from 863 to 1 once the tie was confined to its own scope.
+
+    The exception is unchanged, so every caller that cannot reason about
+    ambiguous scopes keeps failing closed exactly as before.
+    """
+
+    with pytest.raises(SemanticMappingAmbiguous) as info:
+        match_edit_operations(
+            _typed_siblings([("table", "Dup"), ("table", "Dup")]),
+            _typed_siblings([("table", "Dup")], edited=True),
+        )
+    partial = info.value.partial
+    assert partial is not None
+    assert partial.ambiguous_scopes
+
+
+def test_the_confined_scope_claims_no_correspondence_inside_itself() -> None:
+    """Confined, not resolved. Every node in a tied segment becomes a delete or
+    an insert, which is what an undecided alignment honestly means -- guessing
+    one of the readings is the thing this whole mechanism exists to refuse."""
+
+    with pytest.raises(SemanticMappingAmbiguous) as info:
+        match_edit_operations(
+            _typed_siblings([("table", "Dup"), ("table", "Dup")]),
+            _typed_siblings([("table", "Dup")], edited=True),
+        )
+    partial = info.value.partial
+    assert partial is not None
+    tied_base = set(partial.base_to_edited_source)
+    # Nothing inside the tied run was paired off.
+    assert not tied_base
+
+
+def test_a_complete_proof_names_no_ambiguous_scope() -> None:
+    """Absent reads as "this version does not report it"; empty reads as "we
+    looked and there were none"."""
+
+    result = match_edit_operations(
+        _typed_siblings([("paragraph", "A")]),
+        _typed_siblings([("paragraph", "B")], edited=True),
+    )
+    assert result.ambiguous_scopes == ()
+
+
+def _nested(specs: list[tuple[str, str, list[tuple[str, str]]]], *, edited: bool = False) -> list[SemanticNode]:
+    """Build one level of nesting: each spec is (type, value, children)."""
+
+    side = "edited" if edited else "base"
+    nodes: list[SemanticNode] = []
+    ordinal = 0
+    for parent_type, parent_value, children in specs:
+        parent_id = f"{side}-{parent_value.lower()}"
+        nodes.append(
+            SemanticNode(
+                parent_id,
+                parent_type,
+                None,
+                ordinal,
+                fingerprint_semantic_value(parent_value),
+                leaves=() if edited else (_leaf(f"n[{ordinal + 1}]", parent_value),),
+                payload_free=_PAYLOAD_FREE_BY_TYPE[parent_type],
+            )
+        )
+        ordinal += 1
+        seen: dict[str, int] = {}
+        for child_type, child_value in children:
+            count = seen.get(child_value, 0)
+            seen[child_value] = count + 1
+            nodes.append(
+                SemanticNode(
+                    f"{side}-{parent_value.lower()}-{child_value.lower()}-{count}",
+                    child_type,
+                    parent_id,
+                    ordinal,
+                    fingerprint_semantic_value(child_value),
+                    leaves=() if edited else (_leaf(f"n[{ordinal + 1}]", child_value),),
+                    payload_free=_PAYLOAD_FREE_BY_TYPE[child_type],
+                )
+            )
+            ordinal += 1
+    return nodes
+
+
+def test_a_tie_leaves_the_correspondence_beside_it_standing() -> None:
+    """The point of confinement. `Keep` is a table, the only one on either side,
+    and it pairs the same way in both readings of the paragraph tie next to it --
+    so it is proven on exactly the criterion the unique case uses.
+
+    Before this, a tie took its whole residual run with it. A run is only the
+    siblings between two exact anchors, so an edited neighbour with nothing
+    ambiguous about it lost its correspondence for being adjacent.
+    """
+
+    with pytest.raises(SemanticMappingAmbiguous) as info:
+        match_edit_operations(
+            _typed_siblings([("table", "Keep"), ("paragraph", "Dup"), ("paragraph", "Dup")]),
+            _typed_siblings([("table", "KeepEdited"), ("paragraph", "Dup")], edited=True),
+        )
+    partial = info.value.partial
+    assert partial is not None
+    assert partial.base_to_edited_source == {"base-keep-0": "edited-keepedited-0"}
+
+
+def test_two_independent_ties_are_recorded_as_two_scopes() -> None:
+    """One tie must not be reported as the document's only ambiguity when a
+    second, unrelated one exists -- a caller sizing the damage from the scope
+    list would read the page as half as ambiguous as it is."""
+
+    with pytest.raises(SemanticMappingAmbiguous) as info:
+        match_edit_operations(
+            _nested(
+                [
+                    ("table", "First", [("paragraph", "Dup"), ("paragraph", "Dup")]),
+                    ("table", "Second", [("paragraph", "Twin"), ("paragraph", "Twin")]),
+                ]
+            ),
+            _nested(
+                [
+                    ("table", "First", [("paragraph", "Dup")]),
+                    ("table", "Second", [("paragraph", "Twin")]),
+                ],
+                edited=True,
+            ),
+        )
+    partial = info.value.partial
+    assert partial is not None
+    assert len(partial.ambiguous_scopes) == 2
+
+
+def test_a_nested_tie_does_not_unmatch_its_own_parent() -> None:
+    """The tie is among one parent's residual children. The parent itself is
+    matched before the walk ever descends, so it must survive -- losing it would
+    detach every sibling subtree hanging off it."""
+
+    with pytest.raises(SemanticMappingAmbiguous) as info:
+        match_edit_operations(
+            _nested([("table", "Holder", [("paragraph", "Dup"), ("paragraph", "Dup")])]),
+            _nested([("table", "Holder", [("paragraph", "Dup")])], edited=True),
+        )
+    partial = info.value.partial
+    assert partial is not None
+    assert partial.base_to_edited_source.get("base-holder") == "edited-holder"
+
+
+def test_the_tied_pair_itself_is_still_refused() -> None:
+    """Confinement must not become resolution. Where the readings genuinely
+    disagree, no correspondence is claimed -- that is the whole safety property,
+    and it is the one an over-eager fix would trade away first."""
+
+    with pytest.raises(SemanticMappingAmbiguous) as info:
+        match_edit_operations(
+            _typed_siblings([("paragraph", "Dup"), ("paragraph", "Dup")]),
+            _typed_siblings([("paragraph", "Dup")], edited=True),
+        )
+    partial = info.value.partial
+    assert partial is not None
+    assert partial.base_to_edited_source == {}
+
+
+def test_the_forced_pair_budget_claims_less_rather_than_deciding_differently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Past its budget the recovery claims no pairs, which is the answer from
+    before it existed. The tie still raises and the scope is still recorded, so
+    a caller cannot tell which side of the bound it landed on except by getting
+    less correspondence -- never a different verdict.
+
+    Driven by lowering the bound rather than by building a matrix big enough to
+    cross it: the shipped bound is far above anything a real sibling run
+    reaches, so every fixture would otherwise leave this branch unexercised.
+    """
+
+    base = _typed_siblings([("table", "Keep"), ("paragraph", "Dup"), ("paragraph", "Dup")])
+    edited = _typed_siblings([("table", "KeepEdited"), ("paragraph", "Dup")], edited=True)
+
+    with pytest.raises(SemanticMappingAmbiguous) as generous:
+        match_edit_operations(base, edited)
+
+    monkeypatch.setattr(source_map, "_MAX_FORCED_PAIR_CELLS", 0)
+    with pytest.raises(SemanticMappingAmbiguous) as bounded:
+        match_edit_operations(base, edited)
+
+    assert generous.value.partial is not None
+    assert bounded.value.partial is not None
+    # Same refusal, same named scope; strictly fewer claims.
+    assert bounded.value.partial.ambiguous_scopes == generous.value.partial.ambiguous_scopes
+    assert bounded.value.partial.base_to_edited_source == {}
+    assert generous.value.partial.base_to_edited_source == {"base-keep-0": "edited-keepedited-0"}

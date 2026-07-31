@@ -22,10 +22,8 @@ from cfxmark.change_ownership import (
     LeafChange,
     LeafIdentity,
     LeafSnapshot,
-    OwnedChange,
     OwnerRef,
     OwnershipResult,
-    SupersessionWitness,
     classify_changes,
 )
 from cfxmark.exceptions import ConversionError
@@ -47,20 +45,6 @@ if TYPE_CHECKING:
 
 _MIGRATION_EFFECTS = frozenset({"converted", "normalized", "removed", "unsupported"})
 _SOURCE_MAP_FATAL_CODES = frozenset({"semantic-mapping-ambiguous", "semantic-source-map-incomplete"})
-
-# Migration codes whose only effect is to reshape node *position/structure* (never
-# a leaf's content value). A supersession witness is admissible only for these:
-# an emoticon-to-unicode or macro conversion changes what a leaf *says* and can
-# never be a positional side effect that a later structural delete legitimately
-# subsumes.
-#
-# SAFETY INVARIANT -- do not add a code here unless it is content-free: it must
-# not alter the text, tail, attributes, or macro payload of any node, only the
-# presence/position of structurally empty nodes. This set is the trust anchor of
-# condition 2; a content-bearing code would let a genuine content conflict be
-# dissolved as a positional shift. (field==topology and the C0-tombstone subset
-# check give partial defence, but the allowlist must stay content-free on its own.)
-_STRUCTURAL_RESHAPE_CODES = frozenset({"empty-paragraph-dropped"})
 
 
 def _sha256(value: str) -> str:
@@ -776,162 +760,33 @@ def _move_edit_is_ambiguous(candidate: CfxArtifact) -> bool:
     return any(move.edited_node_id not in nodes for move in moves)
 
 
-def _supersession_witnesses(
-    *,
-    overlapping: Sequence[LeafChange],
-    migration_owners: Mapping[LeafIdentity, OwnerRef],
-    user_owners: Mapping[LeafIdentity, OwnerRef],
-    occurrence_codes: Mapping[str, str],
-    source: Mapping[LeafIdentity, str],
-    baseline: Mapping[LeafIdentity, str],
-    final: Mapping[LeafIdentity, str],
-    final_candidate: CfxArtifact,
-) -> tuple[dict[LeafIdentity, SupersessionWitness], dict[LeafIdentity, str]]:
-    """Dissolve a migration/user overlap only with a mechanical supersession proof.
-
-    A leaf that both a migration occurrence and a user operation change is fatal
-    unless every condition holds: the leaf is a derived *topology* leaf; its
-    migration owner is a lone structural-reshape occurrence; its user owner is a
-    lone ``delete`` operation whose C0-space tombstones cover the *entire* C0 node
-    that migration occurrence created -- matched by C0 leaf identity AND
-    fingerprint, never by the shifted final positional path. Only a delete
-    qualifies: it removes the C0 node outright, so the migration's reshaping is
-    demonstrably consumed. A relocation would leave that node alive elsewhere in
-    C1, where its ownership is a separate question, so it stays fatal. When the
-    delete conditions hold the change is a disclosed composition (the migration
-    report shows the reshape, the edit shows the delete) and the leaf may be
-    attributed to the user. Returns the witnesses and their user owners, keyed by
-    leaf identity; anything not proved stays overlapping/fatal.
-    """
-
-    operations = {operation_id(item): item for item in final_candidate.edit_operations}
-    leaves_by_occurrence: dict[str, set[LeafIdentity]] = defaultdict(set)
-    for identity, owner in migration_owners.items():
-        if isinstance(owner, str):
-            leaves_by_occurrence[owner].add(identity)
-
-    witnesses: dict[LeafIdentity, SupersessionWitness] = {}
-    owners: dict[LeafIdentity, str] = {}
-    for change in overlapping:
-        leaf = change.identity
-        if leaf[1] != "topology":
-            continue
-        migration_owner = migration_owners.get(leaf)
-        user_owner = user_owners.get(leaf)
-        if not isinstance(migration_owner, str) or not isinstance(user_owner, str):
-            continue
-        if occurrence_codes.get(migration_owner) not in _STRUCTURAL_RESHAPE_CODES:
-            continue
-        c0_fingerprint = baseline.get(leaf)
-        if c0_fingerprint is None:
-            continue
-        operation = operations.get(user_owner)
-        if operation is None or operation.kind != "delete":
-            continue
-        tombstones = {
-            _identity(tombstone): tombstone.value_fingerprint for tombstone in operation.deleted_leaf_tombstones
-        }
-        if leaf not in tombstones:
-            continue
-        migration_c0_leaves = {
-            identity: baseline[identity]
-            for identity in leaves_by_occurrence.get(migration_owner, set())
-            if baseline.get(identity) is not None
-        }
-        if not migration_c0_leaves:
-            continue
-        # The delete must remove the WHOLE C0 node the migration created, every
-        # leaf matched by C0 identity and fingerprint -- not merely brush the
-        # shared topology leaf.
-        if any(tombstones.get(identity) != fingerprint for identity, fingerprint in migration_c0_leaves.items()):
-            continue
-        witnesses[leaf] = SupersessionWitness(
-            final_leaf=leaf,
-            before_fingerprint=source.get(leaf),
-            after_fingerprint=final.get(leaf),
-            migration_occurrence_id=migration_owner,
-            c0_intermediate_fingerprint=c0_fingerprint,
-            user_operation_id=user_owner,
-            tombstone_kind="delete",
-        )
-        owners[leaf] = user_owner
-    return witnesses, owners
-
-
-def _verify_supersession_witnesses(
+def _verify_no_hidden_migration_owners(
     *,
     artifact: CfxArtifact,
     fresh_candidate: CfxArtifact,
-    source_storage: str,
 ) -> None:
-    """Independently re-derive every supersession witness and close the trust gap.
+    """Reject user attribution for a leaf fresh storage proves migration-owned.
 
-    The prover may move a migration/user overlap to ``intended`` only behind a
-    witness. Publish preflight must therefore (1) re-derive the witnesses from
-    fresh S0 -- the fresh migration ownership plus the artifact's already-verified
-    edit operations -- and compare them to the stored set, and (2) reject any
-    ``intended`` leaf that is independently migration-owned yet carries no witness,
-    which is exactly the forgery the classifier alone could not catch.
+    The former exception existed only for ``empty-paragraph-dropped``. The blank
+    paragraph marker removes that migration itself, so no production migration
+    may dissolve a migration/user overlap. This independent check keeps future
+    structural migrations fail-closed unless their complete ownership contract
+    is deliberately redesigned.
     """
 
     ownership = artifact.ownership_proof
     assert ownership is not None
     fresh_proof = fresh_candidate.ownership_proof
     if fresh_proof is None:
-        if ownership.supersession_witnesses:
-            raise ConversionError("candidate supersession witness has no reproducible migration proof")
-        return
-    # Defense in depth: a witness is re-derived from the fresh no-edit migration
-    # ownership, so that no-edit baseline must itself be clean. A publishable
-    # witnessed candidate always has a non-fatal fresh baseline (a source with an
-    # unclassified loss would leave the edited artifact fatal too), so this never
-    # rejects a legitimate candidate -- it only refuses to trust a witness derived
-    # from a broken baseline.
-    if fresh_proof.fatal and ownership.supersession_witnesses:
-        raise ConversionError("candidate supersession witness rests on a fatal fresh migration proof")
-
-    source = _fingerprints(source_storage)
-    baseline = _fingerprints(fresh_candidate.xhtml)
-    final = _fingerprints(artifact.xhtml)
-    migration_owners: dict[LeafIdentity, OwnerRef] = {change.identity: change.owner for change in fresh_proof.migration}
-    user_owners = _user_owners(
-        baseline=fresh_candidate,
-        candidate=artifact,
-        user_changes=_changes(baseline, final),
-    )
-    report = fresh_candidate.source_migration_report
-    occurrence_codes = (
-        {occurrence.occurrence_id: occurrence.code for occurrence in report.occurrences} if report is not None else {}
-    )
-    final_changes = _changes(source, final)
-    doubly_owned = [
-        change for identity, change in final_changes.items() if identity in migration_owners and identity in user_owners
-    ]
-    rederived, _owners = _supersession_witnesses(
-        overlapping=doubly_owned,
-        migration_owners=migration_owners,
-        user_owners=user_owners,
-        occurrence_codes=occurrence_codes,
-        source=source,
-        baseline=baseline,
-        final=final,
-        final_candidate=artifact,
-    )
-    # Compare the stored witnesses as the exact canonical ordered tuple the prover
-    # emits (sorted by final_leaf), NOT a final_leaf-keyed dict. A dict silently
-    # collapses a duplicate final_leaf, so a forged witness paired with a valid one
-    # for the same leaf would survive in the hash-bound envelope while the check
-    # passed. Reject duplicates outright and require exact tuple equality.
-    stored_leaves = [witness.final_leaf for witness in ownership.supersession_witnesses]
-    if len(stored_leaves) != len(set(stored_leaves)):
-        raise ConversionError("candidate supersession witness has a duplicate final leaf")
-    rederived_witnesses = tuple(rederived[identity] for identity in sorted(rederived))
-    if ownership.supersession_witnesses != rederived_witnesses:
-        raise ConversionError("candidate supersession witness does not match an independent re-derivation")
-    migration_leaves = set(migration_owners)
+        # This check is the independent half of the source-bound proof. Without
+        # a fresh proof there is no authority for saying that a leaf belongs to
+        # the author rather than a migration, so accepting the candidate would
+        # turn a missing verifier result into permission to publish.
+        raise ConversionError("publish preflight cannot verify migration ownership without an independent proof")
+    migration_leaves = {change.identity for change in fresh_proof.migration}
     for change in ownership.intended:
-        if change.identity in migration_leaves and change.identity not in rederived:
-            raise ConversionError("candidate hides a migration owner behind a witness-less user attribution")
+        if change.identity in migration_leaves:
+            raise ConversionError("candidate hides a migration owner behind user attribution")
 
 
 def prove_candidate_ownership(
@@ -1038,43 +893,9 @@ def prove_candidate_ownership(
         change for identity, change in user_changes.items() if isinstance(user_owners.get(identity), tuple)
     )
 
-    occurrence_codes = {
-        occurrence.occurrence_id: occurrence.code
-        for occurrence in occurrences_from_diagnostics(
-            base_artifact.diagnostics,
-            source_storage_sha256=base_artifact.source_storage_sha256,
-        )
-    }
-    witnesses, witnessed_owners = _supersession_witnesses(
-        overlapping=result.overlapping,
-        migration_owners=migration_owners,
-        user_owners=user_owners,
-        occurrence_codes=occurrence_codes,
-        source=source,
-        baseline=baseline,
-        final=final,
-        final_candidate=final_candidate,
-    )
-    remaining_overlapping = tuple(change for change in result.overlapping if change.identity not in witnesses)
-    superseded_intended = tuple(
-        OwnedChange(
-            identity=change.identity,
-            owner=witnessed_owners[change.identity],
-            before_fingerprint=change.before_fingerprint,
-            after_fingerprint=change.after_fingerprint,
-        )
-        for change in result.overlapping
-        if change.identity in witnesses
-    )
-    combined_intended = tuple(sorted((*result.intended, *superseded_intended), key=lambda change: change.identity))
-    ordered_witnesses = tuple(witnesses[identity] for identity in sorted(witnesses))
-
     return replace(
         result,
         source_leaves=tuple(LeafSnapshot(identity, fingerprint) for identity, fingerprint in sorted(source.items())),
-        intended=combined_intended,
-        overlapping=remaining_overlapping,
-        supersession_witnesses=ordered_witnesses,
         unclassified=_deduplicate_changes((*result.unclassified, *migration_unclassified, *user_unclassified)),
         multiple_owners=_deduplicate_changes((*result.multiple_owners, *migration_multiple, *user_multiple)),
         fatal_diagnostic_codes=tuple(dict.fromkeys(fatal_codes)),

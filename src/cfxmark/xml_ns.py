@@ -16,6 +16,7 @@ renderer, and canonicalization modules.
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 
 import lxml.etree as ET
 from lxml.builder import ElementMaker
@@ -79,6 +80,7 @@ def ns_of(tag: object) -> str | None:
     return None
 
 
+@lru_cache(maxsize=256)
 def storage_qualified_name(name: str | bytes) -> str:
     """Return the canonical name used in storage source-map identities."""
 

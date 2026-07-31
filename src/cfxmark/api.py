@@ -13,6 +13,7 @@ import json
 import re
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from typing import Literal
 from urllib.parse import unquote, urlsplit
@@ -1982,13 +1983,16 @@ def _to_cfx_artifact_core(
         if operation_base is not None
         else (base_artifact.source_map_entries if base_artifact is not None else None)
     )
+    identity_base_nodes = semantic_base_nodes or (base_artifact.semantic_nodes if base_artifact is not None else ())
+    identities_applied = base_artifact is None
     try:
         if base_artifact is not None:
             document = apply_macro_identities(
                 document,
                 identities=base_artifact.macro_identities,
-                base_nodes=semantic_base_nodes or base_artifact.semantic_nodes,
+                base_nodes=identity_base_nodes,
             )
+            identities_applied = True
         (
             semantic_nodes,
             operation_to_storage,
@@ -2017,6 +2021,36 @@ def _to_cfx_artifact_core(
                 source_fingerprint=source_fingerprint,
             )
         )
+        # Retried WITH the base, taking the confined proof the tie left behind.
+        # Dropping the base here was the defect: a tie inside one table discarded
+        # the correspondence for the whole document, and the unattributed leaves
+        # that produced were counted in the thousands across the Story corpus.
+        #
+        # Identity carry is retried on the same terms, and only here -- reaching
+        # a partial correspondence is gated on the blocking diagnostic above
+        # already being recorded, so no caller can be handed identities drawn
+        # from an undecided alignment without also being told the walk tied.
+        # Left fail-closed, a duplicate paragraph pair anywhere stripped the
+        # `macro-id` off every macro on the page, including macros the walk had
+        # proven and the tie never touched.
+        #
+        # Only the scope-confined tie carries a `partial`; the other ambiguity
+        # raises do not, and this call aligns against `identity_base_nodes`
+        # while `candidate_maps` uses `op_base_nodes` -- which diverge when a C0
+        # baseline is supplied. So identity carry can fail where candidate
+        # generation would have succeeded, and letting that escape would turn an
+        # inspectable candidate back into no candidate at all, which is the
+        # regression this whole branch exists to undo. Carrying nothing is the
+        # behaviour before any of this, and the blocking diagnostic is recorded
+        # either way.
+        if not identities_applied and base_artifact is not None:
+            with suppress(SemanticMappingAmbiguous):
+                document = apply_macro_identities(
+                    document,
+                    identities=base_artifact.macro_identities,
+                    base_nodes=identity_base_nodes,
+                    accept_partial_correspondence=True,
+                )
         (
             semantic_nodes,
             operation_to_storage,
@@ -2029,9 +2063,12 @@ def _to_cfx_artifact_core(
             unmapped_storage,
         ) = candidate_maps(
             document,
+            base_nodes=op_base_nodes,
+            base_source_map_entries=op_base_entries,
             registry=registry,
             attachment_filename_map=opts.attachment_filename_map,
             presentation_occurrences=presentation_occurrences,
+            accept_partial_correspondence=True,
         )
     if base_artifact is not None and _asset_transport_identity_changed(
         markdown,
@@ -2547,14 +2584,21 @@ def from_jira_wiki(
     **Experimental and lossy.** The Jira wiki dialect is looser and
     less formally specified than the Confluence Storage Format, and
     several inline constructs (``{color}`` colour emphasis, ``~sub~``
-    / ``+ins+`` / ``^sup^``, user mentions, ``{panel}`` styling) have
-    no equivalent on the Markdown side and are dropped with warnings
-    recorded on the returned :class:`ConversionResult`. See
-    :mod:`cfxmark.parsers.jira_wiki` for the full contract.
+    / ``+ins+`` / ``^sup^``, ``{panel}`` styling) have no equivalent on
+    the Markdown side and are reported through ``warnings`` on the
+    returned :class:`ConversionResult`: the body reads differently but
+    every word survives.
+
+    User mentions are not in that group. ``[~alice]`` is removed
+    outright, so it is reported through ``losses`` — part of the body
+    is not there, and a caller deciding whether it may summarise from
+    this Markdown needs that distinction rather than a warning it
+    shares with a lost colour. See :mod:`cfxmark.parsers.jira_wiki`
+    for the full contract.
 
     :param source: Raw Jira wiki markup text. Empty / ``None`` inputs
         return a :class:`ConversionResult` with an empty Markdown
-        body and no warnings.
+        body, no warnings and no losses.
     :param options: Conversion options for the Markdown render phase.
         Style fields (``bullet_marker``, ``code_fence``) apply; the
         ``passthrough_html_comment_prefixes`` field is ignored
@@ -2575,11 +2619,16 @@ def from_jira_wiki(
             document=Document(children=()),
         )
     _validate_public_text_input(source)
-    document, parse_warnings, attachments = parse_jira_wiki(source)
+    document, parse_warnings, parse_losses, attachments = parse_jira_wiki(source)
     markdown = render_md(document, options=opts.md_options())
     return ConversionResult(
         markdown=markdown,
         warnings=tuple(parse_warnings),
+        # Reported apart from warnings because they mean different things to a
+        # reader: a warning says the body reads differently, a loss says part of
+        # it is not there. A caller deciding whether it may summarise from this
+        # Markdown needs the second, and used to be handed only the first.
+        losses=tuple(parse_losses),
         attachments=attachments,
         document=document,
     )

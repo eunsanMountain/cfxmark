@@ -276,6 +276,19 @@ def test_link() -> None:
     assert md('<p><a href="https://example.com">label</a></p>') == "[label](https://example.com)"
 
 
+def test_anchor_without_href_uses_exact_editable_html() -> None:
+    storage = "<p><a>file:line</a></p>"
+
+    assert md(storage) == "file:line"
+    assert (
+        cfxmark.to_md(
+            storage,
+            options=cfxmark.ConversionOptions(profile="editable"),
+        ).markdown.rstrip("\n")
+        == "<a>file:line</a>"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Lists
 # ---------------------------------------------------------------------------

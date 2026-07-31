@@ -335,6 +335,48 @@ def test_noncanonical_table_is_a_readable_protected_island() -> None:
     assert "After edited" in candidate.xhtml
 
 
+def test_ragged_table_is_readable_but_remote_backed_during_outside_edit() -> None:
+    """A row wider than the header must not pad every other row on publish.
+
+    A live corpus page contains a mostly two-column table with one intentional four-cell
+    row. GFM reparses it as a rectangular four-column table, so the readable
+    projection is useful but cannot be the authority for that table's storage.
+    """
+
+    table = (
+        "<table><thead><tr><th>key</th><th>value</th></tr></thead><tbody>"
+        "<tr><td>a</td><td>b</td></tr>"
+        "<tr><td>prefix</td><td>left</td><td>delta</td><td>right</td></tr>"
+        "</tbody></table>"
+    )
+    storage = table + "<p>After</p>"
+
+    base = cfxmark.to_md_artifact(storage, options=EDITABLE)
+
+    assert base.status == "ready_to_edit"
+    assert tuple(region.kind for region in base.protected_regions) == ("table-island",)
+    candidate = cfxmark.to_cfx_artifact(
+        base.markdown.replace("After", "After edited"),
+        presentation=base.presentation,
+        base_artifact=base,
+        splice_source=storage,
+        options=EDITABLE,
+    )
+    assert candidate.push_safe is True
+    assert table in candidate.xhtml
+    cfxmark.validate_managed_cfx_artifact(candidate, source_storage=storage, options=EDITABLE)
+
+    edited_table = cfxmark.to_cfx_artifact(
+        base.markdown.replace("delta", "changed"),
+        presentation=base.presentation,
+        base_artifact=base,
+        splice_source=storage,
+        options=EDITABLE,
+    )
+    assert edited_table.push_safe is False
+    assert any(item.code == "protected-region-edited" for item in edited_table.diagnostics)
+
+
 @pytest.mark.parametrize("change", ["edit", "move", "delete", "duplicate"])
 def test_noncanonical_table_island_change_is_blocked(change: str) -> None:
     storage = (
@@ -1114,7 +1156,7 @@ def test_empty_paragraph_and_jira_macro_identity_survive_unrelated_edit() -> Non
     base = cfxmark.to_md_artifact(storage, options=EDITABLE)
 
     assert base.status == "ready_to_edit"
-    assert base.markdown.startswith("<br>")
+    assert base.markdown.startswith("<!-- cfxmark:blank -->")
     candidate = cfxmark.to_cfx_artifact(
         base.markdown.replace("After", "Edited"),
         base_artifact=base,
@@ -1523,3 +1565,119 @@ def test_edited_expand_passes_managed_validation() -> None:
     )
 
     cfxmark.validate_cfx_artifact(candidate, source_storage=storage)
+
+
+# ---------------------------------------------------------------------------
+# Identity carry across a tie somewhere else on the page.
+#
+# `apply_macro_identities` ran inside the same `try` as candidate generation and
+# called the matcher bare, so a tie ANYWHERE raised before a single identity was
+# applied and the retry rebuilt from the document that never received them. The
+# macro did not have to be near the tie, or touched by it, to lose its `macro-id`.
+# ---------------------------------------------------------------------------
+
+
+def _tie_source(macro_id: str) -> str:
+    """An identity-bearing code macro, then two identical paragraphs."""
+
+    return (
+        f'<ac:structured-macro ac:name="code" ac:macro-id="{macro_id}">'
+        "<ac:plain-text-body><![CDATA[old]]></ac:plain-text-body>"
+        "</ac:structured-macro><p>Dup</p><p>Dup</p>"
+    )
+
+
+def _edit_body_and_drop_one_duplicate(markdown: str, *, drop: bool) -> str:
+    seen = 0
+    kept = []
+    for line in markdown.replace("old", "new").splitlines(keepends=True):
+        if drop and "Dup" in line:
+            seen += 1
+            if seen == 2:
+                continue
+        kept.append(line)
+    return "".join(kept)
+
+
+@pytest.mark.parametrize("with_tie", [False, True], ids=["no-tie", "tie-elsewhere"])
+def test_macro_identity_survives_a_tie_it_is_not_part_of(with_tie: bool) -> None:
+    """A controlled pair: the macro and its edit are identical in both runs, and
+    the only variable is whether an unrelated paragraph tie exists. Measured
+    before the fix, `with_tie=True` regenerated the macro without its id while
+    the body edit landed unchanged -- so the loss was invisible in the output.
+
+    The tie must still block the publish. Carrying the identity says the walk
+    proved this pairing, not that the candidate is safe to send.
+    """
+
+    storage = _tie_source("keep-me")
+    base = cfxmark.to_md_artifact(storage, options=EDITABLE)
+    candidate = cfxmark.to_cfx_artifact(
+        _edit_body_and_drop_one_duplicate(base.markdown, drop=with_tie),
+        presentation=base.presentation,
+        base_artifact=base,
+        splice_source=storage,
+        options=EDITABLE,
+    )
+
+    assert "new" in candidate.xhtml  # the edit itself landed either way
+    assert candidate.xhtml.count('ac:macro-id="keep-me"') == 1
+    tied = "semantic-mapping-ambiguous" in {item.code for item in candidate.diagnostics}
+    assert tied is with_tie
+    # Confining a tie must never be mistaken for resolving it.
+    assert candidate.push_safe is not with_tie
+
+
+def test_identity_is_never_read_off_a_synthesized_insert_id() -> None:
+    """Stable ids for inserted nodes are derived from content, so a node
+    inserted as a byte-identical copy of a base node is handed that base node's
+    id. Reading identities out of that map would reattach a remote `macro-id` to
+    a duplicate the matcher explicitly refused to pair.
+
+    This was latent: the bare matcher raised first, so nothing downstream was
+    ever reached. Taking a confined tie removes that accident, which makes the
+    proven-pairs-only rule load-bearing rather than incidental.
+    """
+
+    storage = _expand(schema="1", macro_id="e-7", body="Same")
+    base = cfxmark.to_md_artifact(storage, options=EDITABLE)
+    # Duplicate the macro AND tie elsewhere, so the confined-tie path is taken.
+    duplicated = base.markdown.rstrip() + "\n\n" + base.markdown.rstrip() + "\n\nx\n\nx\n"
+
+    candidate = cfxmark.to_cfx_artifact(
+        duplicated,
+        presentation=base.presentation,
+        base_artifact=base,
+        splice_source=storage,
+        options=EDITABLE,
+    )
+
+    assert candidate.push_safe is False
+    assert candidate.xhtml.count('ac:macro-id="e-7"') == 0
+
+
+def test_a_confined_tie_leaves_no_unattributed_leaf_outside_itself() -> None:
+    """Identity carry and attribution are two different questions, and the tie
+    used to lose both. Measured on this fixture: before, the macro regenerated
+    without its id AND left one leaf with no source-bound owner; after, it keeps
+    the id and the proof attributes every leaf it touches.
+
+    The remaining refusal is the tie itself, which is the honest answer -- the
+    two readings of the duplicate pair really are undecided.
+    """
+
+    storage = _tie_source("keep-me")
+    base = cfxmark.to_md_artifact(storage, options=EDITABLE)
+    candidate = cfxmark.to_cfx_artifact(
+        _edit_body_and_drop_one_duplicate(base.markdown, drop=True),
+        presentation=base.presentation,
+        base_artifact=base,
+        splice_source=storage,
+        options=EDITABLE,
+    )
+
+    proof = candidate.ownership_proof
+    assert proof is not None
+    assert proof.unclassified == ()
+    assert proof.fatal is True
+    assert "semantic-mapping-ambiguous" in proof.fatal_diagnostic_codes

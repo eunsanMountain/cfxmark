@@ -31,6 +31,22 @@ from cfxmark.artifacts import (
 from cfxmark.assets import AssetFetcher, ResolveMode, resolve_assets
 from cfxmark.ast import CellBackground
 from cfxmark.change_ownership import ChangeArtifacts, LeafChange, LeafSnapshot, OwnedChange, OwnershipResult
+from cfxmark.compatibility import (
+    CONVERTER_GAP,
+    CONVERTER_GAP_BLOCKED,
+    EQUIVALENT,
+    IDENTITY_BEARING,
+    IDENTITY_CARRY,
+    MARKDOWN_IDENTITY_BOUND,
+    MARKDOWN_LOSSLESS,
+    NAMED_LOSS,
+    NAMED_LOSS_CONSENTABLE,
+    UNKNOWN,
+    UNKNOWN_BLOCKED,
+    CompatibilityReport,
+    assess_candidate,
+    assess_markdown_compatibility,
+)
 from cfxmark.diagnostics import ConversionDiagnostic, DiagnosticLocation, DiagnosticResolution
 from cfxmark.exceptions import (
     PUBLIC_CONVERSION_REASON_CODES,
@@ -50,6 +66,7 @@ from cfxmark.normalize import (
     server_normalize_cfx,
     strip_passthrough_comments,
 )
+from cfxmark.opaque import strip_header_notice
 from cfxmark.ownership_proof import (
     StorageComparison,
     storage_noop_comparison,
@@ -69,6 +86,21 @@ from cfxmark.presentation import (
 from cfxmark.source_map import EditOperation, SourceMapEntry, StorageLeafRef
 
 __all__ = [
+    "strip_header_notice",
+    "CONVERTER_GAP",
+    "CONVERTER_GAP_BLOCKED",
+    "EQUIVALENT",
+    "IDENTITY_BEARING",
+    "IDENTITY_CARRY",
+    "MARKDOWN_IDENTITY_BOUND",
+    "MARKDOWN_LOSSLESS",
+    "NAMED_LOSS",
+    "NAMED_LOSS_CONSENTABLE",
+    "UNKNOWN",
+    "UNKNOWN_BLOCKED",
+    "CompatibilityReport",
+    "assess_candidate",
+    "assess_markdown_compatibility",
     "__version__",
     "ConversionOptions",
     "ConversionResult",

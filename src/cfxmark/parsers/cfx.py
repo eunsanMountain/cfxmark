@@ -611,11 +611,13 @@ def _parse_html_inline(
     if tag == "code":
         return [InlineCode(content=_collect_text(element))]
     if tag == "a":
+        href_present = "href" in element.attrib
         href = element.get("href") or ""
         title = element.get("title")
         return [
             Link(
                 url=href,
+                href_present=href_present,
                 title=title,
                 children=_parse_inline(element, ctx),
             )
@@ -861,12 +863,17 @@ def _parse_paragraph(element: ET._Element, ctx: ParserContext) -> BlockNode | No
     except _InlineEscalation as ex:
         ctx.warnings.append(f"paragraph escalated to opaque: {ex.reason}")
         return _as_opaque(element, ctx)
-    # Project an empty storage paragraph as an explicit Markdown break. The
-    # managed remote-subtree path retains the exact empty ``<p></p>`` bytes
-    # when the user edits elsewhere, while the visible projection remains
-    # stable and editable boundaries stay explicit.
+    # Project an empty storage paragraph as an explicit Markdown break. Preserve
+    # the exact, metadata-free bare form separately: the managed path has been
+    # measured rewriting untouched ``<p/>`` nodes to ``<p><br/></p>`` after an
+    # unrelated edit, and the two forms render at different heights.
     if _is_paragraph_empty(inline):
-        return Paragraph(children=(HardBreak(),), align=_parse_alignment(element))
+        bare_empty = not element.attrib and not len(element) and element.text in (None, "")
+        return Paragraph(
+            children=(HardBreak(),),
+            align=_parse_alignment(element),
+            bare_empty=bare_empty,
+        )
     return Paragraph(children=inline, align=_parse_alignment(element))
 
 
@@ -928,10 +935,38 @@ def _parse_list(element: ET._Element, ctx: ParserContext) -> List:
         start = int(start_attr)
 
     items: list[ListItem] = []
+    # Read before the items are parsed, from the storage itself: a `<p>` sitting
+    # directly inside an `<li>` is exactly what CommonMark calls a loose list.
+    # Deriving it afterwards from the parsed blocks cannot work, because parsing
+    # packs a bare inline run into a Paragraph too, and by then the two forms
+    # look identical.
+    item_elements = [child for child in element if isinstance(child.tag, str) and strip_ns(child.tag) == "li"]
+    wrapped = [
+        any(isinstance(grand.tag, str) and strip_ns(grand.tag) == "p" for grand in item) for item in item_elements
+    ]
+    # Every item, not any. CommonMark's tight/loose is a property of the whole
+    # list -- there is no spelling for "these two items are wrapped and that one
+    # is not". Storage can hold such a list anyway, and `any` here promoted the
+    # whole thing to loose, adding a paragraph to items nobody had touched: the
+    # same class of damage this change exists to stop, in the other direction.
+    #
+    # So a mixed list stays tight, which is what it already did, and the
+    # compatibility registry reports it as a shape Markdown cannot hold.
+    loose = bool(wrapped) and all(wrapped)
+    # A mixed list is no longer flattened. `List.loose` stays the list-level property the
+    # format defines, and each item now also carries what it actually was, so the way back
+    # can reproduce a shape CommonMark has no single spelling for. The comment above used to
+    # end "so a mixed list stays tight" -- it did, and it cost an item nobody edited its
+    # paragraph wrapper.
+    index = 0
     for child in element:
         if strip_ns(child.tag) == "li":
-            items.append(_parse_list_item(child, ctx))
-    return List(list_type=list_type, items=tuple(items), start=start)
+            item = _parse_list_item(child, ctx)
+            if index < len(wrapped) and wrapped[index] and not loose:
+                item = replace(item, loose=True)
+            items.append(item)
+            index += 1
+    return List(list_type=list_type, items=tuple(items), start=start, loose=loose)
 
 
 def _parse_list_item(element: ET._Element, ctx: ParserContext) -> ListItem:

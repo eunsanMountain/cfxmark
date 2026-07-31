@@ -18,7 +18,7 @@ from cfxmark.renderers.cfx import render_cfx
 from cfxmark.renderers.md import MarkdownRenderOptions, render_md
 from cfxmark.source_map import EditOperation, SemanticNode, SourceKind, SourceMapEntry, StorageLeafRef
 from cfxmark.storage_map import extract_storage_source, storage_leaf_identity
-from cfxmark.xml_ns import storage_node_name, storage_semantic_path
+from cfxmark.xml_ns import storage_node_name
 
 
 def build_remote_subtrees(
@@ -90,10 +90,11 @@ def claim_base_remote_leaves(
         return semantic_nodes, storage_to_node, node_to_storage, source_map_entries, unmapped
     document_id = next(node.node_id for node in semantic_nodes if node.parent_id is None)
     owner_by_path = tuple((item.remote_node_path, item.node_id) for item in remote_subtrees)
+    owner_index, owner_prefix_lengths = _remote_owner_index(owner_by_path)
     claimed: dict[str, list[StorageLeafRef]] = defaultdict(list)
     remaining: list[StorageLeafRef] = []
     for leaf in unmapped:
-        owner = next((node_id for path, node_id in owner_by_path if _remote_contains_leaf(leaf, path)), None)
+        owner = _first_remote_owner(leaf, owner_index, owner_prefix_lengths)
         if owner is None and leaf.semantic_path == ("#fragment[0]",) and leaf.field == "topology":
             owner = document_id
         if owner is None:
@@ -172,9 +173,7 @@ def apply_remote_subtree_splice(
 
     source_root = _parse_fragment_to_element(splice_source)
     candidate_root = _parse_fragment_to_element(candidate_xhtml)
-    original_paths = tuple(
-        (storage_semantic_path(candidate_root, element), element) for element in candidate_root.iterdescendants()
-    )
+    original_paths = _semantic_element_paths(candidate_root)
     candidate_paths = _candidate_paths(source_map_entries)
     planned: list[tuple[RemoteSubtreeArtifact, ET._Element, ET._Element, tuple[str, ...]]] = []
     for artifact in reusable:
@@ -205,35 +204,40 @@ def apply_remote_subtree_splice(
 
     spliced = _serialize_children_exact(candidate_root)
     actual = extract_storage_source(spliced)
+    current_paths = {element: path for path, element in _semantic_element_paths(candidate_root)}
     preserved_paths = tuple(
-        (storage_semantic_path(candidate_root, element), artifact.node_id, artifact.remote_subtree_fingerprint)
+        (current_paths[element], artifact.node_id, artifact.remote_subtree_fingerprint)
         for artifact, element in replacements
     )
+    preserved_index, preserved_prefix_lengths = _remote_owner_index(
+        tuple((path, owner) for path, owner, _fingerprint in preserved_paths)
+    )
     existing_by_identity = {storage_leaf_identity(leaf): entry for entry in source_map_entries for leaf in entry.leaves}
+    source_entries_by_prefix: defaultdict[tuple[str, ...], list[tuple[StorageLeafRef, SourceMapEntry]]] = defaultdict(
+        list
+    )
+    for entry in source_map_entries:
+        for leaf in entry.leaves:
+            for length in range(1, len(leaf.semantic_path) + 1):
+                source_entries_by_prefix[leaf.semantic_path[:length]].append((leaf, entry))
     rebased_by_identity: dict[tuple[tuple[str, ...], str, str | None, int], list[SourceMapEntry]] = defaultdict(list)
     for old_path, element in original_paths:
-        if not any(ancestor is candidate_root for ancestor in element.iterancestors()):
+        new_path = current_paths.get(element)
+        if new_path is None:
             continue
-        new_path = storage_semantic_path(candidate_root, element)
-        for entry in source_map_entries:
-            for leaf in entry.leaves:
-                if leaf.semantic_path[: len(old_path)] != old_path:
-                    continue
-                rebased_identity = (
-                    new_path + leaf.semantic_path[len(old_path) :],
-                    leaf.field,
-                    leaf.attribute_name,
-                    leaf.occurrence_ordinal,
-                )
-                rebased_by_identity[rebased_identity].append(entry)
+        for leaf, entry in source_entries_by_prefix.get(old_path, ()):
+            rebased_identity = (
+                new_path + leaf.semantic_path[len(old_path) :],
+                leaf.field,
+                leaf.attribute_name,
+                leaf.occurrence_ordinal,
+            )
+            rebased_by_identity[rebased_identity].append(entry)
     grouped: dict[tuple[str, SourceKind, str], list[StorageLeafRef]] = defaultdict(list)
     unmapped: list[StorageLeafRef] = []
     fallback_owner = replacements[0][0].node_id
     for leaf in actual.leaves:
-        preserved_owner = next(
-            (owner for path, owner, _fingerprint in preserved_paths if _remote_contains_leaf(leaf, path)),
-            None,
-        )
+        preserved_owner = _first_remote_owner(leaf, preserved_index, preserved_prefix_lengths)
         if preserved_owner is not None:
             grouped[(f"preserve:{preserved_owner}", "protected-region", preserved_owner)].append(leaf)
             continue
@@ -266,6 +270,25 @@ def apply_remote_subtree_splice(
         for path, node_id, fingerprint in preserved_paths
     )
     return spliced, entries, tuple(unmapped), preserved, required, skipped, proofs
+
+
+def _semantic_element_paths(root: ET._Element) -> tuple[tuple[tuple[str, ...], ET._Element], ...]:
+    """Index each element by the same sibling-aware path used by storage leaves."""
+
+    result: list[tuple[tuple[str, ...], ET._Element]] = []
+
+    def visit(parent: ET._Element, prefix: tuple[str, ...]) -> None:
+        counts: defaultdict[str, int] = defaultdict(int)
+        for child in parent:
+            name = storage_node_name(child)
+            ordinal = counts[name]
+            counts[name] += 1
+            path = prefix + (f"{name}[{ordinal}]",)
+            result.append((path, child))
+            visit(child, path)
+
+    visit(root, ())
+    return tuple(result)
 
 
 def _top_level_nodes(nodes: tuple[SemanticNode, ...]) -> tuple[SemanticNode, ...]:
@@ -355,6 +378,32 @@ def _is_under(path: tuple[str, ...], prefix: tuple[str, ...]) -> bool:
 
 def _remote_contains_leaf(leaf: StorageLeafRef, prefix: tuple[str, ...]) -> bool:
     return _is_under(leaf.semantic_path, prefix) and not (leaf.semantic_path == prefix and leaf.field == "tail")
+
+
+def _remote_owner_index(
+    owner_by_path: tuple[tuple[tuple[str, ...], str], ...],
+) -> tuple[dict[tuple[str, ...], tuple[int, str]], tuple[int, ...]]:
+    indexed: dict[tuple[str, ...], tuple[int, str]] = {}
+    for position, (path, owner) in enumerate(owner_by_path):
+        indexed.setdefault(path, (position, owner))
+    return indexed, tuple(sorted({len(path) for path in indexed}))
+
+
+def _first_remote_owner(
+    leaf: StorageLeafRef,
+    indexed: dict[tuple[str, ...], tuple[int, str]],
+    prefix_lengths: tuple[int, ...],
+) -> str | None:
+    selected: tuple[int, str] | None = None
+    for length in prefix_lengths:
+        if length > len(leaf.semantic_path):
+            break
+        match = indexed.get(leaf.semantic_path[:length])
+        if match is None or (length == len(leaf.semantic_path) and leaf.field == "tail"):
+            continue
+        if selected is None or match[0] < selected[0]:
+            selected = match
+    return selected[1] if selected is not None else None
 
 
 def _leaf_sort_key(leaf: StorageLeafRef) -> tuple[tuple[str, ...], str, str, int]:

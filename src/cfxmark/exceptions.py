@@ -83,6 +83,11 @@ class DiagnosticSummary:
     table_ordinal: int | None = None
 
 
+#: How many leaf identities an error message shows before it stops being readable.
+#: A display budget, not a redaction: every identity is already value-free.
+MAX_SUMMARY_IDENTITIES = 10
+
+
 @dataclass(frozen=True)
 class OwnershipProofSummary:
     """Value-free summary of why a managed ownership proof is fatal.
@@ -99,6 +104,39 @@ class OwnershipProofSummary:
     overlap_count: int
     top_identities: tuple[LeafIdentity, ...] = ()
     diagnostics: tuple[DiagnosticSummary, ...] = ()
+    #: Every fatal leaf identity, uncapped — ``top_identities`` is its first page.
+    #:
+    #: Both are the same value-free projection and neither carries a fingerprint, so
+    #: the cap was never a safety boundary; it is a display budget for an error
+    #: message. A caller diagnosing *why* a corpus fails needs the whole set, and
+    #: reading the capped one silently turns "these documents share a cause" into
+    #: "these documents share a cause among the first ten" — which is how a real
+    #: grouping was reported wrong. Consumers that render to a user should keep
+    #: using ``top_identities``.
+    all_identities: tuple[LeafIdentity, ...] = ()
+
+    def __post_init__(self) -> None:
+        # `all_identities` defaults to whatever `top_identities` holds, and that default
+        # is the load-bearing half of this invariant rather than a convenience.
+        #
+        # The check below used to be guarded by `if self.all_identities`, which let the one
+        # state this field exists to prevent through: `top_identities` populated and
+        # `all_identities` empty. That is what *every* construction predating this field
+        # produces, including anything rebuilding a summary from a serialized older payload
+        # — so a consumer following the docstring's own advice and reading the full set
+        # would get `()` while ten or more fatal identities sat beside it. Empty is
+        # indistinguishable from "no leaves", which is the reporting failure the field was
+        # added to end, arrived at from the other direction.
+        #
+        # Filling it instead of raising keeps older construction working and makes the
+        # misleading state unrepresentable. What a caller supplied is then all this summary
+        # claims to know.
+        if not self.all_identities and self.top_identities:
+            object.__setattr__(self, "all_identities", self.top_identities)
+        # The cap is a view of the full list, not a separate answer. Without this
+        # they can drift and a reader has no way to tell which one is the truth.
+        if self.top_identities != self.all_identities[:MAX_SUMMARY_IDENTITIES]:
+            raise ValueError("top_identities must be the first page of all_identities")
 
 
 class OwnershipProofError(ConversionError):

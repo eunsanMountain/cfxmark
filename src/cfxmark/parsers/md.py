@@ -22,12 +22,15 @@ Parsing strategy:
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from mistletoe import Document as MdDocument
 from mistletoe import block_token, span_token
 
 from cfxmark.ast import (
+    BLANK_PARAGRAPH_MARKER,
+    LOOSE_LIST_MARKER,
+    TIGHT_LIST_MARKER,
     AlignedSpan,
     BlockNode,
     BlockQuote,
@@ -65,6 +68,7 @@ from cfxmark.ast import (
     Text,
     Underline,
     UnsupportedMarker,
+    parse_mixed_list_marker,
 )
 from cfxmark.exceptions import ParseError
 from cfxmark.image_metadata import (
@@ -238,15 +242,27 @@ def _has_unescaped_pipe(text: str) -> bool:
     return False
 
 
-def _backtick_is_escaped(line: str, pos: int) -> bool:
-    """Whether the backtick at ``pos`` is a backslash-escaped literal.
+def _cannot_open_code_span(line: str, pos: int) -> bool:
+    """Whether the backtick at ``pos`` is unable to OPEN a code span.
 
-    A ``\\``` is a literal backtick to the CommonMark/mistletoe inline parser,
-    not a code-span delimiter, so it never opens or closes a code span. The
-    table code-span ambiguity check must skip it, or literal backticks that
-    happen to straddle a ``|`` cell boundary (a Confluence table cell holding
-    the text ``\\`x | y\\```) are wrongly reported as an unescaped pipe inside a
-    code span.
+    Mirrors mistletoe's own opener, ``(?<!\\\\|`)(?:\\\\\\\\)*(`+)(?!`)``, because
+    what this check is approximating is what mistletoe will do with the line
+    afterwards. Two ways to fail it:
+
+    A ``\\``` is a literal backtick, not a delimiter -- odd backslash parity. The
+    table check must skip it, or literal backticks that straddle a ``|`` cell
+    boundary (a cell holding the text ``\\`x | y\\```) get reported as an
+    unescaped pipe inside a code span.
+
+    A backslash run that is *itself* preceded by a backtick also fails, and
+    parity alone does not see it. In ``` ``\\\\` ```, the final backtick has even
+    parity, so parity says "can open" -- but mistletoe's lookbehind sees the
+    backtick before the ``\\\\`` run and refuses. The scan would then open a span
+    there, find a closer further along, and report the cell delimiter between
+    them. Measured: ``| ``\\\\` a|b` |`` was refused outright while mistletoe
+    reads no code element in that cell at all, so nothing was at stake and the
+    publish was blocked anyway. Only reachable once the scan resumes past an
+    unmatched opener instead of abandoning the line.
     """
 
     backslashes = 0
@@ -254,13 +270,15 @@ def _backtick_is_escaped(line: str, pos: int) -> bool:
     while cursor >= 0 and line[cursor] == "\\":
         backslashes += 1
         cursor -= 1
-    return backslashes % 2 == 1
+    if backslashes % 2 == 1:
+        return True
+    return cursor >= 0 and line[cursor] == "`"
 
 
 def _line_has_ambiguous_code_pipe(line: str) -> bool:
     cursor = 0
     while cursor < len(line):
-        if line[cursor] != "`" or _backtick_is_escaped(line, cursor):
+        if line[cursor] != "`" or _cannot_open_code_span(line, cursor):
             cursor += 1
             continue
         opener_end = cursor
@@ -269,7 +287,20 @@ def _line_has_ambiguous_code_pipe(line: str) -> bool:
         delimiter_length = opener_end - cursor
         close_start = opener_end
         while close_start < len(line):
-            if line[close_start] != "`" or _backtick_is_escaped(line, close_start):
+            # No escape test here, deliberately. CommonMark: "backslash escapes
+            # do not work in code spans", so once a span is open a backslash is
+            # ordinary content and the next backtick run closes it.
+            #
+            # Applying the text rule here mislocated the end of any span whose
+            # content ends in a backslash. Measured on a live page: a cell
+            # holding `<code>\</code>` followed by literal backticks opened a
+            # span at the backslash, skipped its real closer as "escaped", and
+            # ran on to a backtick two hundred characters later -- swallowing
+            # the cell boundaries and reporting the row's own delimiters as an
+            # ambiguous pipe. The page could not be published at all, and the
+            # message sent the reader looking for a pipe to escape in Markdown
+            # that had none.
+            if line[close_start] != "`":
                 close_start += 1
                 continue
             close_end = close_start
@@ -282,7 +313,15 @@ def _line_has_ambiguous_code_pipe(line: str) -> bool:
                 break
             close_start = close_end
         else:
-            return False
+            # An opener with no matching closer is literal text in CommonMark,
+            # not a reason to stop reading the line. Giving up here meant a
+            # genuine later span was never examined at all: a row like
+            # `` | ` ``x|\`` | `` passed and produced a two-cell body row under a
+            # one-column header, silently, with the pipe splitting the cells.
+            #
+            # Resuming costs nothing -- `opener_end` is always past `cursor`, so
+            # the scan still terminates.
+            cursor = opener_end
     return False
 
 
@@ -529,11 +568,10 @@ class _MdConverter:
     # ---- block-level ------------------------------------------------------
 
     def convert_document(self, tok: MdDocument) -> Document:
-        blocks: list[BlockNode] = []
-        for child in tok.children or []:
-            for b in self._convert_block(child):
-                blocks.append(b)
-        return Document(children=tuple(blocks))
+        # The same walk as every other block sequence. It used to have its own
+        # loop, which meant the top level was the one place a list-shape marker
+        # was never seen -- and the top level is where a pull writes them.
+        return Document(children=tuple(self._convert_blocks(list(tok.children or []))))
 
     def _convert_block(self, tok: block_token.BlockToken) -> list[BlockNode]:
         if isinstance(tok, block_token.Heading):
@@ -570,9 +608,60 @@ class _MdConverter:
         return []
 
     def _convert_blocks(self, children: list[block_token.BlockToken]) -> list[BlockNode]:
+        """Convert one block sequence, binding a list-shape marker to what follows it.
+
+        The marker is bound here rather than carried on the converter, and that is
+        the whole correctness argument. Held as converter state it was not scoped
+        to anything: measured, `<!-- cfxmark:list loose -->` followed by a
+        paragraph and then a list applied itself to that later list, and a marker
+        with no list after it stayed armed for the next one at any depth.
+
+        Here it reaches exactly one place -- the next block in this same sequence,
+        which is also the same nesting depth -- and anything else clears it.
+        """
+
         result: list[BlockNode] = []
-        for c in children:
-            result.extend(self._convert_block(c))
+        pending: bool | None = None
+        pending_mixed: tuple[int, ...] | None = None
+        for child in children:
+            if _is_blank_paragraph_marker(child):
+                result.append(Paragraph(children=(HardBreak(),), bare_empty=True))
+                # A blank paragraph is a real intervening block. It consumes any
+                # list marker that incorrectly precedes it instead of allowing
+                # that marker to jump forward to a later list.
+                pending = None
+                pending_mixed = None
+                continue
+            mixed = _mixed_list_items(child, self.pre.source)
+            if mixed is not None:
+                pending_mixed = None if pending_mixed is not None else mixed
+                continue
+            marker = _list_shape_marker(child, self.pre.source)
+            if marker is not None:
+                # A second marker before a list is a contradiction we will not
+                # resolve by picking one.
+                pending = None if pending is not None else marker
+                continue
+            nodes = self._convert_block(child)
+            if pending is not None:
+                if len(nodes) == 1 and isinstance(nodes[0], List):
+                    nodes = [replace(nodes[0], loose=pending)]
+                # Cleared whether or not it applied. A marker that missed its
+                # list is spent, not stored.
+                pending = None
+            if pending_mixed is not None:
+                # The list stays tight -- that is what `List.loose` means and the items
+                # disagree -- and the named items carry their own shape, which is the only
+                # thing that can rebuild `<li>a</li><li><p>b</p></li>`.
+                if len(nodes) == 1 and isinstance(nodes[0], List):
+                    listing = nodes[0]
+                    items = tuple(
+                        replace(item, loose=True) if index in pending_mixed else item
+                        for index, item in enumerate(listing.items)
+                    )
+                    nodes = [replace(listing, items=items, loose=False)]
+                pending_mixed = None
+            result.extend(nodes)
         return result
 
     def _parse_inner_body(self, source: str) -> tuple[BlockNode, ...]:
@@ -653,7 +742,20 @@ class _MdConverter:
             blocks = self._convert_blocks(item.children or [])
             items.append(ListItem(children=tuple(blocks)))
         list_type = ListType.ORDERED if is_ordered else ListType.BULLET
-        return List(list_type=list_type, items=tuple(items), start=start)
+        # CommonMark's own answer, not a guess: blank lines between items, or an
+        # item holding two blocks, make a list loose. A marker from a pull
+        # overrides it, and only downwards -- it can say "this was tight in
+        # storage", never "make this loose", so a hand-written loose list cannot
+        # be turned tight by a stray comment.
+        # CommonMark's own answer. A marker, when there is one, is applied by
+        # `_convert_blocks`, which is the only place that knows whether this list
+        # is the block immediately after it.
+        return List(
+            list_type=list_type,
+            items=tuple(items),
+            start=start,
+            loose=bool(getattr(tok, "loose", False)),
+        )
 
     def _convert_table(self, tok: block_token.Table) -> Table:
         alignments = [_convert_align(a) for a in getattr(tok, "column_align", []) or []]
@@ -776,6 +878,19 @@ class _MdConverter:
                     out.append(node_cls(children=tuple(_coalesce_adjacent_text(inner))))
                     i = next_i
                     continue
+                if kind == "open" and tag == "a":
+                    content = (getattr(raw, "content", "") or "").strip()
+                    if content == "<a>":
+                        inner, next_i = self._convert_span_sequence(tokens, i + 1, "a")
+                        out.append(
+                            Link(
+                                url="",
+                                href_present=False,
+                                children=tuple(_coalesce_adjacent_text(inner)),
+                            )
+                        )
+                        i = next_i
+                        continue
                 if kind == "self" and tag == "br":
                     out.append(HardBreak())
                     i += 1
@@ -972,6 +1087,94 @@ class _MdConverter:
         # Unknown span: drop with warning.
         self.warnings.append(f"unsupported span token {type(tok).__name__!s} dropped")
         return []
+
+
+def _list_shape_marker(tok: block_token.BlockToken, source: str) -> bool | None:
+    """The looseness a pull recorded for the next list, if this block is that note.
+
+    The *whole* paragraph must be the marker and nothing else. Matching its first
+    line was a content-losing bug: a marker followed immediately by prose is one
+    paragraph to CommonMark, so treating the paragraph as a marker and dropping it
+    deleted the prose -- silently, with `push_safe` still true and no diagnostic.
+
+    A marker inside a code block is a different token type and never reaches
+    here; inside a blockquote it is dropped as an HTML comment with a blocking
+    diagnostic, which is fail-closed. A comment an author wrote inside a sentence
+    is one child among several, so it stays content.
+    """
+
+    if not isinstance(tok, block_token.Paragraph):
+        return None
+    # Two signals, and both are needed. The token must have exactly one child --
+    # that is what makes "the whole paragraph" exact, since a marker followed
+    # immediately by prose is one paragraph of three children, and matching only
+    # the first source line deleted that prose. And the source line must be the
+    # marker, because preprocessing rewrites comments before mistletoe sees them,
+    # so the child's own text is no longer the marker by the time we are here.
+    children = list(getattr(tok, "children", None) or ())
+    if len(children) != 1:
+        return None
+    line = _marker_text(children[0], tok, source)
+    if line == TIGHT_LIST_MARKER:
+        return False
+    if line == LOOSE_LIST_MARKER:
+        return True
+    return None
+
+
+def _marker_text(child: object, tok: block_token.BlockToken, source: str) -> str:
+    """The marker this one-child paragraph spells, container prefix and all.
+
+    The child's own content is authoritative and works at any depth. Indexing the outer
+    source line does not: inside a blockquote the raw line carries `> `, so it never
+    matched, and inside a macro body `line_number` indexes a different document.
+    """
+
+    content = getattr(child, "content", None)
+    if isinstance(content, str) and content.strip().startswith("<!--"):
+        return content.strip()
+    line_number = getattr(tok, "line_number", 0)
+    lines = source.splitlines()
+    if not (1 <= line_number <= len(lines)):
+        return ""
+    return lines[line_number - 1].strip()
+
+
+def _is_blank_paragraph_marker(tok: block_token.BlockToken) -> bool:
+    """Return whether ``tok`` contains only the bare-paragraph marker."""
+
+    if not isinstance(tok, block_token.Paragraph):
+        return False
+    children = tok.children or []
+    marker_token_types = (span_token.RawText,) if _HtmlSpanToken is None else (span_token.RawText, _HtmlSpanToken)
+    return (
+        len(children) == 1
+        and isinstance(children[0], marker_token_types)
+        and children[0].content == BLANK_PARAGRAPH_MARKER
+    )
+
+
+def _mixed_list_items(tok: block_token.BlockToken, source: str) -> tuple[int, ...] | None:
+    """The item indices a mixed marker above this list names, if any.
+
+    The *whole* paragraph must be the marker, for the same reason `_list_shape_marker`
+    says so and with the same two guards. This function was added later without them and
+    matched only the first source line, so `_convert_blocks` discarded the entire token:
+    a marker plus one typed sentence is a single paragraph to CommonMark, and the sentence
+    was deleted silently with `push_safe` still true and no diagnostic. A setext heading
+    under the marker went the same way, which is what the type guard is for -- it is not a
+    paragraph at all.
+
+    Reachable from an ordinary edit rather than a contrived one: a pull writes this marker
+    as the file's first line, so typing a sentence above the list is enough.
+    """
+
+    if not isinstance(tok, block_token.Paragraph):
+        return None
+    if len(list(getattr(tok, "children", None) or ())) != 1:
+        return None
+    children = list(getattr(tok, "children", None) or ())
+    return parse_mixed_list_marker(_marker_text(children[0], tok, source))
 
 
 def _plain_span_text(tokens: list[span_token.SpanToken]) -> str:

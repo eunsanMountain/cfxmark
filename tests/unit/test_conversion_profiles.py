@@ -487,7 +487,12 @@ def test_boundary_nbsp_survives_heading_list_and_blockquote() -> None:
 
     markdown_1 = cfxmark.to_md(storage, options=options("editable")).markdown
 
-    assert markdown_1 == ("# &nbsp;Title&nbsp;\n\n- &nbsp;Item&nbsp;\n\n> &nbsp;Quote&nbsp;\n")
+    # The list marker is expected: a one-item list has no blank line *between*
+    # items to be loose with, so the shape a pull read from storage is recorded
+    # instead of being silently unwrapped on the way back.
+    assert markdown_1 == (
+        "# &nbsp;Title&nbsp;\n\n<!-- cfxmark:list loose -->\n- &nbsp;Item&nbsp;\n\n> &nbsp;Quote&nbsp;\n"
+    )
     storage_1 = cfxmark.to_cfx(markdown_1, options=options("editable")).xhtml
     assert storage_1 is not None
     assert storage_1.count("\u00a0") == 6

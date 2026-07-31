@@ -84,6 +84,7 @@ class Link(Node):
     """Hyperlink (``[text](url)`` / ``<a href>``)."""
 
     url: str
+    href_present: bool = True
     title: str | None = None
     children: tuple[InlineNode, ...] = field(default_factory=tuple)
 
@@ -240,6 +241,15 @@ class Paragraph(Node):
 
     children: tuple[InlineNode, ...] = field(default_factory=tuple)
     align: str | None = None
+    #: The source storage paragraph was the exact bare form ``<p/>`` (or the
+    #: XML-equivalent ``<p></p>``), not ``<p><br/></p>``.
+    #:
+    #: Confluence renders the two forms differently. Markdown therefore needs
+    #: separate spellings or an unrelated edit silently rewrites untouched page
+    #: spacing. Only an attribute-free, child-free paragraph may set this flag;
+    #: paragraphs carrying style, comments, or other metadata remain on the
+    #: diagnostic path.
+    bare_empty: bool = False
 
 
 @dataclass(frozen=True)
@@ -277,6 +287,13 @@ class List(Node):
     list_type: ListType
     items: tuple[ListItem, ...] = field(default_factory=tuple)
     start: int = 1
+    #: CommonMark's tight/loose distinction, carried rather than re-derived.
+    #: A loose list wraps each item's content in a paragraph and a tight one
+    #: does not, and storage records the difference: ``<li><p>x</p></li>`` and
+    #: ``<li>x</li>`` are stored and rendered differently by the server. Without
+    #: this field both spell as ``- x`` and the wrapper is lost on the way back,
+    #: which changed list items nobody had edited.
+    loose: bool = False
 
 
 @dataclass(frozen=True)
@@ -284,6 +301,14 @@ class ListItem(Node):
     """A single list entry. Children are block-level."""
 
     children: tuple[BlockNode, ...] = field(default_factory=tuple)
+    #: Whether *this item* was wrapped in a paragraph in storage.
+    #:
+    #: CommonMark has no spelling for "these items are wrapped and that one is not", and
+    #: storage holds such lists anyway. `List.loose` stays the list-level property the
+    #: format defines; this records what the item actually was, so a mixed list can be
+    #: reproduced instead of flattened. Only a mixed list needs it -- a uniform one is
+    #: fully described by `List.loose`.
+    loose: bool = False
 
 
 @dataclass(frozen=True)
@@ -505,3 +530,47 @@ __all__ = [
     "Document",
     "AnyNode",
 ]
+
+
+#: Written before a list whose storage shape CommonMark cannot spell, and read
+#: back by the Markdown parser. Defined here so the parser and the renderer
+#: share one spelling rather than importing each other.
+TIGHT_LIST_MARKER = "<!-- cfxmark:list tight -->"
+
+#: The mirror of the above, for a loose list CommonMark would read back tight.
+#: A one-item list has no blank line *between* items to be loose with.
+LOOSE_LIST_MARKER = "<!-- cfxmark:list loose -->"
+
+#: Exact control spelling for an attribute-free, child-free storage ``<p/>``.
+#:
+#: The marker travels with the paragraph instead of storing a document-wide
+#: ordinal, so inserting another blank elsewhere cannot shift restoration onto
+#: the wrong block.
+BLANK_PARAGRAPH_MARKER = "<!-- cfxmark:blank -->"
+
+#: The third spelling, for a list whose items disagree.
+#:
+#: `<!-- cfxmark:list loose=0,2 -->` names which items storage had wrapped. The two markers
+#: above already invent spellings for shapes CommonMark cannot express; this is the same
+#: device for the case where the shape varies per item, which the parser previously had to
+#: flatten. Written by a pull, never by an author.
+MIXED_LIST_MARKER_PREFIX = "<!-- cfxmark:list loose="
+
+
+def mixed_list_marker(indices: tuple[int, ...]) -> str:
+    return f"{MIXED_LIST_MARKER_PREFIX}{','.join(str(index) for index in indices)} -->"
+
+
+def parse_mixed_list_marker(line: str) -> tuple[int, ...] | None:
+    """The item indices a mixed marker names, or `None` if this is not one."""
+
+    text = line.strip()
+    if not text.startswith(MIXED_LIST_MARKER_PREFIX) or not text.endswith("-->"):
+        return None
+    body = text[len(MIXED_LIST_MARKER_PREFIX) : -len("-->")].strip()
+    if not body:
+        return None
+    try:
+        return tuple(int(part) for part in body.split(",") if part != "")
+    except ValueError:
+        return None

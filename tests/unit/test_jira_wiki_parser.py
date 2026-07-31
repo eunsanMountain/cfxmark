@@ -43,12 +43,21 @@ from cfxmark.parsers.jira_wiki import parse_jira_wiki
 
 
 def parse(source: str) -> Document:
-    document, _warnings, _attachments = parse_jira_wiki(source)
+    document, _warnings, _losses, _attachments = parse_jira_wiki(source)
     return document
 
 
 def parse_full(source: str):
-    return parse_jira_wiki(source)
+    """``(document, warnings, attachments)``, the shape these tests read.
+
+    `losses` is dropped here rather than threaded through every caller: the
+    tests below are about the parsed document, and the loss channel has its
+    own tests. A helper that returns four values so one test can use the
+    fourth makes the other forty read worse.
+    """
+
+    document, warnings, _losses, attachments = parse_jira_wiki(source)
+    return document, warnings, attachments
 
 
 def first_block(source: str):
@@ -289,12 +298,21 @@ def test_attachment_link_document_extension() -> None:
     assert "notes.msg" in attachments
 
 
-def test_user_mention_dropped_with_warning() -> None:
-    document, warnings, _ = parse_full("cc [~johndoe] please review")
+def test_user_mention_is_dropped_and_reported_as_a_loss() -> None:
+    """It used to be reported as a warning, and that was the wrong channel.
+
+    A warning says the body reads differently; a loss says part of it is not
+    there. The mention is removed outright, so it is the second -- and while it
+    was a warning, the reading projection called such a body complete with a
+    person's name gone from it.
+    """
+
+    document, warnings, losses, _attachments = parse_jira_wiki("cc [~johndoe] please review")
     para = document.children[0]
     assert isinstance(para, Paragraph)
     assert not any(isinstance(n, Link) for n in para.children)
-    assert any("mention" in w for w in warnings)
+    assert any("mention" in loss for loss in losses)
+    assert not any("mention" in warning for warning in warnings)
 
 
 # ---------------------------------------------------------------------------

@@ -35,7 +35,9 @@ Unsupported constructs
   ``8월~9월`` (a Korean date range) survives intact because neither
   end has a word boundary, while hypothetical ``word ~hint~ word``
   loses its subscript styling but keeps ``hint`` visible.
-* ``[~username]`` user mentions — dropped with a warning.
+* ``[~username]`` user mentions — dropped, and reported through
+  ``losses`` rather than ``warnings``. The text is removed outright,
+  so a caller asking whether the body is complete must be told no.
 * ``{color:#hex}...{color}`` — content kept, color emphasis dropped
   with a warning (D4 matches renderer policy).
 * ``{panel:title=...}`` — mapped to a ``note`` admonition with a
@@ -142,6 +144,14 @@ _HORIZONTAL_RULE_RE = re.compile(r"^-{4,}\s*$")
 @dataclass
 class _ParseContext:
     warnings: list[str] = field(default_factory=list)
+    #: Text that is GONE from the Markdown, kept apart from warnings.
+    #:
+    #: A warning says something reads differently; a loss says something is not
+    #: there. Collapsing the two let a dropped user mention be reported as a
+    #: warning, which left the reading projection calling the body complete
+    #: while a person's name had vanished from it -- an agent summarising the
+    #: issue would never mention them, and nothing said why.
+    losses: list[str] = field(default_factory=list)
     attachments: list[str] = field(default_factory=list)
 
     def add_attachment(self, filename: str) -> None:
@@ -278,8 +288,10 @@ def _try_parse_link(text: str, start: int, ctx: _ParseContext) -> tuple[InlineNo
                                      extensions or a :class:`Link`
                                      with an ``attachment:`` URL
                                      for everything else
-    * ``[~username]``              — user mention; dropped with a
-                                     warning
+    * ``[~username]``              — user mention; dropped and
+                                     recorded as a loss, since the
+                                     text is removed rather than
+                                     restyled
 
     Returns ``(node, next_index)`` or ``None`` on no match.
     """
@@ -327,7 +339,8 @@ def _try_parse_link(text: str, start: int, ctx: _ParseContext) -> tuple[InlineNo
 
     # User mention — drop with warning
     if inner.startswith("~"):
-        ctx.warnings.append(f"user mention [{inner}] dropped")
+        # A loss, not a warning: the text is removed outright.
+        ctx.losses.append(f"user mention [{inner}] dropped")
         return Text(content=""), next_i
 
     # Labelled or bare URL. Find the first *unescaped* top-level ``|``.
@@ -1235,26 +1248,26 @@ def _parse_blocks(source: str, ctx: _ParseContext) -> list[BlockNode]:
 
 def parse_jira_wiki(
     source: str,
-) -> tuple[Document, list[str], tuple[str, ...]]:
+) -> tuple[Document, list[str], list[str], tuple[str, ...]]:
     """Parse a Jira wiki markup string into a cfxmark AST.
 
     :param source: Jira wiki markup text. Empty / ``None`` inputs
         produce an empty :class:`Document` without raising.
-    :returns: ``(document, warnings, attachments)``. ``attachments``
+    :returns: ``(document, warnings, losses, attachments)``. ``attachments``
         is a tuple of filenames referenced via ``[^file]`` or
         ``!file!`` syntax, in document order and deduplicated, so
         the caller can fetch them out-of-band.
     """
 
     if not source:
-        return Document(children=()), [], ()
+        return Document(children=()), [], [], ()
     ctx = _ParseContext()
     try:
         blocks = _parse_blocks(source, ctx)
     except Exception as exc:  # pragma: no cover — defensive
         raise ParseError(f"failed to parse jira wiki markup: {exc}") from exc
     document = Document(children=tuple(blocks))
-    return document, ctx.warnings, tuple(ctx.attachments)
+    return document, ctx.warnings, ctx.losses, tuple(ctx.attachments)
 
 
 __all__ = ["parse_jira_wiki"]

@@ -26,6 +26,9 @@ from dataclasses import dataclass
 from typing import Literal
 
 from cfxmark.ast import (
+    BLANK_PARAGRAPH_MARKER,
+    LOOSE_LIST_MARKER,
+    TIGHT_LIST_MARKER,
     AlignedSpan,
     BlockNode,
     BlockQuote,
@@ -62,6 +65,7 @@ from cfxmark.ast import (
     Text,
     Underline,
     UnsupportedMarker,
+    mixed_list_marker,
 )
 from cfxmark.colors import coarse_color
 from cfxmark.exceptions import ConversionError
@@ -408,6 +412,10 @@ def _render_inline_node(
         return _render_inline_code(node.content, escape_pipes=table_cell)
     if isinstance(node, Link):
         label = _render_inline_text(node.children, opts=opts, table_cell=table_cell)
+        if not node.href_present:
+            if opts.profile == "editable":
+                return f"<a>{label}</a>"
+            return label
         if not label and opts.profile != "editable":
             label = _escape_text(node.url)
         destination = _render_link_destination(node.url)
@@ -601,6 +609,8 @@ def _render_block(block: BlockNode, opts: MarkdownRenderOptions) -> str:
         body = _render_inline_text(block.children, opts=opts).strip(" \t\r\n")
         return "#" * level + " " + _protect_boundary_nbsp(body)
     if isinstance(block, Paragraph):
+        if block.bare_empty and len(block.children) == 1 and isinstance(block.children[0], HardBreak):
+            return BLANK_PARAGRAPH_MARKER
         body = _render_inline_text(block.children, opts=opts).strip("\n")
         body = _protect_boundary_nbsp(body)
         body = _escape_paragraph_lines(body)
@@ -665,6 +675,21 @@ def _render_blocks(
     return "\n\n".join(parts)
 
 
+def _commonmark_would_force_loose(node: List) -> bool:
+    """Whether re-parsing this list's Markdown would come back loose.
+
+    True when any item carries more than inline content, because the blank line
+    that separates an item's blocks is exactly what makes CommonMark call a list
+    loose -- and there is no way to write those blocks without it.
+    """
+
+    for item in node.items:
+        blocks = [child for child in item.children if not isinstance(child, List)]
+        if len(blocks) > 1 or any(not isinstance(child, Paragraph) for child in blocks):
+            return True
+    return False
+
+
 def _render_list(
     node: List,
     opts: MarkdownRenderOptions,
@@ -673,7 +698,38 @@ def _render_list(
     """Render a list. ``indent`` is the column the bullet starts at."""
 
     lines: list[str] = []
+    # Item-level shape outranks the list-level marker. A paragraph plus another
+    # block makes CommonMark call the list loose, but storage may wrap only that
+    # item; a plain `tight` marker would erase its `<p>`. The mixed marker names
+    # the wrapped items and therefore has to be chosen first.
+    #
+    # A uniformly tight list can still have no tight spelling in CommonMark:
+    # an item holding a paragraph and a code block makes the whole list loose,
+    # and loose wraps every item in a paragraph. Measured on the corpus, two
+    # pages are exactly this. Rather than quietly wrap items nobody touched, the
+    # shape is recorded so the way back can reproduce it.
+    #
+    # Only for documents that came from storage -- a marker is written by a pull
+    # and never by an author, so hand-written Markdown keeps CommonMark's own
+    # answer and this changes no existing dialect.
+    if not node.loose and any(item.loose for item in node.items):
+        wrapped = tuple(i for i, item in enumerate(node.items) if item.loose)
+        lines.append(f"{indent}{mixed_list_marker(wrapped)}")
+    elif not node.loose and _commonmark_would_force_loose(node):
+        lines.append(f"{indent}{TIGHT_LIST_MARKER}")
+    # And the mirror: looseness is spelled with blank lines *between* items, so a
+    # one-item list has nowhere to put one and comes back tight. Storage holds
+    # `<ul><li><p>Keep</p></li></ul>` readily, and without this it returned as
+    # `<ul><li>Keep</li></ul>` -- a change to an item nobody edited.
+    elif node.loose and len(node.items) < 2:
+        lines.append(f"{indent}{LOOSE_LIST_MARKER}")
     for i, item in enumerate(node.items):
+        # The spelling that makes the distinction survive. A loose list is
+        # written with its items separated by blank lines, which is how
+        # CommonMark says "wrap each item's content in a paragraph" -- and it is
+        # the only way back to `<li><p>x</p></li>` from Markdown.
+        if node.loose and i:
+            lines.append("")
         if node.list_type == ListType.BULLET:
             marker = f"{opts.bullet_marker} "
         else:
@@ -733,7 +789,11 @@ def _render_list_item_body(
             # Nested list renders itself with its own indentation.
             parts.append(_render_list(child, opts, body_indent))
         elif isinstance(child, Paragraph):
-            paragraph = _render_inline_text(child.children, opts=opts).strip("\n")
+            paragraph = (
+                BLANK_PARAGRAPH_MARKER
+                if child.bare_empty and len(child.children) == 1 and isinstance(child.children[0], HardBreak)
+                else _render_inline_text(child.children, opts=opts).strip("\n")
+            )
             parts.append(_protect_boundary_nbsp(paragraph))
         elif isinstance(child, CodeBlock):
             # Code blocks are rendered verbatim; indent all lines.

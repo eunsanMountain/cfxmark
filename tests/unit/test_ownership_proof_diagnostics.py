@@ -90,6 +90,107 @@ def test_ownership_proof_summary_carries_no_values() -> None:
         assert isinstance(ordinal, int)
 
 
+# A page with more fatal leaves than the display budget. Fourteen list items, one
+# inline-code edit each: every item's topology leaf loses its owner the same way the
+# single-item fixture above does, so the proof is fatal with fourteen unclassified
+# leaves and the cap has something to hide.
+def _many_leaf_fatal_candidate() -> tuple[cfxmark.CfxArtifact, str]:
+    source = "<ul>" + "".join(f"<li>run the plain command number {n} now</li>" for n in range(14)) + "</ul>"
+    base = dataclasses.replace(
+        cfxmark.to_md_artifact(source, options=EDITABLE),
+        protected_regions=(),
+        remote_subtrees=(),
+    )
+    candidate = cfxmark.to_cfx_artifact(
+        base.markdown.replace("plain command", "`plain` command"),
+        base_artifact=base,
+        splice_source=source,
+        options=EDITABLE,
+    )
+    assert candidate.ownership_proof is not None
+    assert candidate.ownership_proof.fatal is True
+    return candidate, source
+
+
+def test_the_summary_carries_every_fatal_leaf_not_only_the_ten_it_displays() -> None:
+    """The cap is a display budget, so something has to carry the rest.
+
+    Both lists are the same value-free projection, so ten was never a redaction
+    boundary -- and a caller diagnosing a corpus reads it as one at its peril. A
+    harness grouped nine documents' root causes off `top_identities` and reported
+    shared causes that were only shared *among the first ten* of a thirty-three leaf
+    page. The count was always right there; the shapes it counted were not.
+    """
+
+    candidate, source = _many_leaf_fatal_candidate()
+
+    with pytest.raises(OwnershipProofError) as excinfo:
+        cfxmark.validate_managed_cfx_artifact(candidate, source_storage=source, options=EDITABLE)
+    summary = excinfo.value.summary
+
+    assert summary.unclassified_count == 14
+    assert len(summary.top_identities) == 10
+    # The point of the field: the count and the shapes finally agree.
+    assert len(summary.all_identities) == summary.unclassified_count
+    assert len(set(summary.all_identities)) == 14
+
+
+def test_the_displayed_leaves_are_the_first_page_of_the_full_set() -> None:
+    """Not merely "both are populated". If the two were sorted independently they
+    could disagree about which leaf is first, and a reader comparing an error message
+    against a diagnosis would have no way to tell which one was lying."""
+
+    candidate, source = _many_leaf_fatal_candidate()
+    with pytest.raises(OwnershipProofError) as excinfo:
+        cfxmark.validate_managed_cfx_artifact(candidate, source_storage=source, options=EDITABLE)
+    summary = excinfo.value.summary
+
+    assert summary.top_identities == summary.all_identities[:10]
+    assert list(summary.all_identities) == sorted(summary.all_identities)
+
+
+def test_a_summary_whose_two_lists_disagree_cannot_be_constructed() -> None:
+    """The invariant is enforced where the value is made, not only where it is read.
+
+    Otherwise the guarantee holds for cfxmark's own construction and silently does
+    not for anyone building this dataclass directly -- which the test above would
+    never notice.
+    """
+
+    identities = tuple((("p[0]",), "text", None, n) for n in range(12))
+    with pytest.raises(ValueError, match="first page"):
+        OwnershipProofSummary(
+            fatal_class="unclassified-storage-change",
+            unclassified_count=12,
+            multiple_owners_count=0,
+            overlap_count=0,
+            top_identities=identities[2:12],  # a different ten
+            all_identities=identities,
+        )
+
+
+def test_the_full_leaf_list_carries_no_values_either() -> None:
+    """The uncapped list is the one a diagnosis serializes to a receipt, so its
+    value-freedom is the property that keeps author text out of a shared artifact.
+    Asserted separately from `top_identities`: a projection applied to one list and
+    not the other is exactly the mistake this would catch."""
+
+    candidate, source = _many_leaf_fatal_candidate()
+    with pytest.raises(OwnershipProofError) as excinfo:
+        cfxmark.validate_managed_cfx_artifact(candidate, source_storage=source, options=EDITABLE)
+    summary = excinfo.value.summary
+
+    serialized = repr(summary.all_identities)
+    assert "sha256:" not in serialized
+    assert "plain" not in serialized
+    assert "command" not in serialized
+    for path, field, attribute_name, ordinal in summary.all_identities:
+        assert isinstance(path, tuple)
+        assert isinstance(field, str)
+        assert attribute_name is None or isinstance(attribute_name, str)
+        assert isinstance(ordinal, int)
+
+
 def test_summary_and_diagnostic_summary_are_immutable() -> None:
     summary = OwnershipProofSummary(
         fatal_class="unclassified-storage-change",

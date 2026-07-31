@@ -143,8 +143,16 @@ def test_adjacent_parent_text_normalization_is_named_composed_and_still_blocked(
             "layout-flattened",
             "<p>A</p>",
         ),
-        ("<p>A</p><p></p><p>B</p>", "empty-paragraph-dropped", "<p>A</p><p><br/></p><p>B</p>"),
-        ("<ul><li><p>A</p></li></ul>", "list-item-paragraph-unwrapped", "<ul><li>A</li></ul>"),
+        # `list-item-paragraph-unwrapped` used to be produced here, by a list mixing
+        # wrapped and bare items. C3 closed that: a third `cfxmark:list` marker names which
+        # items were wrapped, so the mixed list round-trips and the diagnostic has no shape
+        # left to come from.
+        #
+        # Removed rather than left failing, and the rule itself is deliberately kept in the
+        # registry -- it is still the right answer if some future shape reaches it. That it
+        # is currently unreachable is worth knowing on its own: a rule nothing can produce
+        # is a candidate for removal, and removing it needs its own evidence rather than
+        # this absence.
         ("<p>A   </p>", "trailing-space-trimmed", "<p>A</p>"),
     ],
 )
@@ -338,15 +346,13 @@ def test_one_final_leaf_owned_by_migration_and_user_edit_is_fatal_overlap() -> N
 
 
 def test_empty_paragraph_deletion_is_c0_owned_and_publishable() -> None:
-    # A remote empty paragraph round-trips to a Markdown <br> (C0 == <p><br/></p>).
-    # Deleting it is a genuine user edit. The C0-bound operation base makes the
-    # user delete op's tombstones cover the migration-introduced br leaf, so the
-    # deletion is user-owned and publishable instead of unclassified -- and the
-    # managed artifact validates, so the migration-witness subset accepts a
-    # transient C0 leaf the user edited away.
+    # A remote bare paragraph now has its own exact Markdown spelling. Deleting
+    # that marker is an ordinary user edit; there is no migration leaf and no
+    # overlap exception involved.
     storage = "<p>Before</p><p/><p>After</p>"
     base = _full_migration_base(storage)
-    markdown = base.markdown.replace("<br>", "").strip()
+    assert "<!-- cfxmark:blank -->" in base.markdown
+    markdown = base.markdown.replace("<!-- cfxmark:blank -->", "").strip()
     candidate = cfxmark.to_cfx_artifact(
         markdown,
         presentation=base.presentation,
@@ -364,14 +370,10 @@ def test_empty_paragraph_deletion_is_c0_owned_and_publishable() -> None:
 
 
 def test_publish_preflight_rejects_dropped_migration_occurrence() -> None:
-    # The migration-witness subset relaxation must not let a forged report hide a
-    # disclosed source loss: every source-side occurrence is still reproduced
-    # byte-for-byte from fresh S0. Deleting the empty-paragraph occurrence from
-    # the stored report is rejected even though the ownership proof is otherwise
-    # self-consistent.
+    # A forged report still cannot hide a real disclosed source loss.
     from cfxmark.migration_report import MigrationReport
 
-    storage = "<p>Before</p><p/><p>After</p>"
+    storage = "<p>Before<!--secret-->After</p>"
     base = _full_migration_base(storage)
     candidate = cfxmark.to_cfx_artifact(
         base.markdown,
@@ -381,10 +383,10 @@ def test_publish_preflight_rejects_dropped_migration_occurrence() -> None:
         options=EDITABLE,
     )
     assert candidate.source_migration_report is not None
-    assert any(item.code == "empty-paragraph-dropped" for item in candidate.source_migration_report.occurrences)
+    assert any(item.code == "xml-comment-dropped" for item in candidate.source_migration_report.occurrences)
     forged_report = MigrationReport.build(
         occurrences=tuple(
-            item for item in candidate.source_migration_report.occurrences if item.code != "empty-paragraph-dropped"
+            item for item in candidate.source_migration_report.occurrences if item.code != "xml-comment-dropped"
         )
     )
     forged = replace(candidate, source_migration_report=forged_report)
@@ -800,128 +802,16 @@ def test_payload_free_block_run_substitution_is_push_safe() -> None:
     cfxmark.validate_cfx_artifact(candidate, source_storage=storage)
 
 
-# ---------------------------------------------------------------------------
-# Supersession witness: a leading empty paragraph dropped by migration and then
-# deleted by the user overlaps on the derived p[0] topology leaf. The witness
-# proves, in C0 space, that the user delete removed exactly the C0 node the
-# migration created, so the overlap dissolves to a user edit instead of a fatal
-# ambiguity. See /tmp/supersession_witness_design.md.
-# ---------------------------------------------------------------------------
-
-_LEADING_EMPTY_PARA_MACRO = (
-    '<p /><ac:structured-macro ac:name="info"><ac:rich-text-body><p>x</p></ac:rich-text-body></ac:structured-macro>'
-)
-
-
-def _delete_leading_br(markdown: str) -> str:
-    return "\n".join(line for line in markdown.split("\n") if line.strip() != "<br>")
-
-
-def test_leading_empty_para_deletion_before_macro_is_witnessed_and_publishable() -> None:
-    storage = _LEADING_EMPTY_PARA_MACRO
-    base = _full_migration_base(storage)
-    edited = _delete_leading_br(base.markdown)
-    candidate = cfxmark.to_cfx_artifact(
-        edited,
-        presentation=base.presentation,
-        base_artifact=base,
-        splice_source=storage,
-        options=EDITABLE,
-    )
-    proof = _proof(candidate)
-    # Without the witness this is a fatal migration-user-overlap on (p[0], topology).
-    assert candidate.push_safe is True
-    assert proof.fatal is False
-    assert proof.overlapping == ()
-    assert proof.blocking_code is None
-    # The dissolved leaf is now a user-owned intended change, backed by exactly
-    # one supersession witness naming the migration occurrence and the user op.
-    assert len(proof.supersession_witnesses) == 1
-    witness = proof.supersession_witnesses[0]
-    assert witness.final_leaf == (("p[0]",), "topology", None, 0)
-    assert witness.tombstone_kind == "delete"
-    assert any(change.identity == (("p[0]",), "topology", None, 0) for change in proof.intended)
-    # The C0 <br> paragraph is gone; the macro survived unchanged.
-    assert candidate.xhtml == (
-        '<ac:structured-macro ac:name="info"><ac:rich-text-body><p>x</p></ac:rich-text-body></ac:structured-macro>'
-    )
-    # Publish preflight independently re-derives and byte-compares the witness.
-    cfxmark.validate_managed_cfx_artifact(candidate, source_storage=storage, options=EDITABLE)
-
-
-def _witnessed_candidate() -> cfxmark.CfxArtifact:
-    base = _full_migration_base(_LEADING_EMPTY_PARA_MACRO)
-    return cfxmark.to_cfx_artifact(
-        _delete_leading_br(base.markdown),
-        presentation=base.presentation,
-        base_artifact=base,
-        splice_source=_LEADING_EMPTY_PARA_MACRO,
-        options=EDITABLE,
-    )
-
-
 def _reseal(candidate: cfxmark.CfxArtifact, ownership: Any) -> cfxmark.CfxArtifact:
-    # Re-hash the ownership envelope so the tampering survives the sha256 binding
-    # and must be caught by the independent witness re-derivation instead.
+    # Re-hash the ownership envelope so tampering survives the sha256 binding and
+    # must be caught by the independent fresh-storage ownership check.
     return replace(candidate, ownership_proof=ownership, ownership_proof_sha256=ownership.sha256())
 
 
-def test_supersession_witness_forged_migration_occurrence_id_is_rejected() -> None:
-    candidate = _witnessed_candidate()
-    ownership = _proof(candidate)
-    (witness,) = ownership.supersession_witnesses
-    tampered = replace(
-        ownership,
-        supersession_witnesses=(replace(witness, migration_occurrence_id="mig_occ_sha256:forged"),),
-    )
-    forged = _reseal(candidate, tampered)
-    with pytest.raises(cfxmark.ConversionError, match="supersession witness"):
-        cfxmark.validate_managed_cfx_artifact(forged, source_storage=_LEADING_EMPTY_PARA_MACRO, options=EDITABLE)
-
-
-def test_supersession_witness_forged_user_operation_id_is_rejected() -> None:
-    candidate = _witnessed_candidate()
-    ownership = _proof(candidate)
-    (witness,) = ownership.supersession_witnesses
-    tampered = replace(
-        ownership,
-        supersession_witnesses=(replace(witness, user_operation_id="op-forged"),),
-    )
-    forged = _reseal(candidate, tampered)
-    with pytest.raises(cfxmark.ConversionError, match="supersession witness"):
-        cfxmark.validate_managed_cfx_artifact(forged, source_storage=_LEADING_EMPTY_PARA_MACRO, options=EDITABLE)
-
-
-def test_supersession_witness_forged_c0_fingerprint_is_rejected() -> None:
-    candidate = _witnessed_candidate()
-    ownership = _proof(candidate)
-    (witness,) = ownership.supersession_witnesses
-    tampered = replace(
-        ownership,
-        supersession_witnesses=(replace(witness, c0_intermediate_fingerprint="sha256:deadbeef"),),
-    )
-    forged = _reseal(candidate, tampered)
-    with pytest.raises(cfxmark.ConversionError, match="supersession witness"):
-        cfxmark.validate_managed_cfx_artifact(forged, source_storage=_LEADING_EMPTY_PARA_MACRO, options=EDITABLE)
-
-
-def test_supersession_witness_removed_but_leaf_kept_intended_is_rejected() -> None:
-    # Dropping the witness while leaving the dissolved leaf in `intended` must not
-    # pass: the independent re-derivation still produces the witness, so the stored
-    # (empty) set no longer matches.
-    candidate = _witnessed_candidate()
-    ownership = _proof(candidate)
-    tampered = replace(ownership, supersession_witnesses=())
-    forged = _reseal(candidate, tampered)
-    with pytest.raises(cfxmark.ConversionError, match="supersession witness"):
-        cfxmark.validate_managed_cfx_artifact(forged, source_storage=_LEADING_EMPTY_PARA_MACRO, options=EDITABLE)
-
-
-def test_witnessless_content_overlap_forced_into_intended_is_rejected() -> None:
-    # The trust-gap closure: a genuine content overlap (emoticon vs a user rewrite)
-    # forged into `intended` with the real user operation as owner and no witness.
-    # The classifier check alone accepts it (the op truly touches the leaf); only
-    # the "migration-owned intended leaf needs a witness" rule rejects it.
+def test_fresh_migration_owner_forced_into_intended_is_rejected() -> None:
+    # The active future guard: a genuine content migration overlap forged into
+    # ``intended`` with a real user operation must still be rejected after the
+    # blank-paragraph-only exception mechanism is removed.
     storage = '<p><ac:emoticon ac:name="smile"/></p>'
     base = _full_migration_base(storage)
     candidate = cfxmark.to_cfx_artifact(
@@ -934,7 +824,6 @@ def test_witnessless_content_overlap_forced_into_intended_is_rejected() -> None:
     ownership = _proof(candidate)
     (overlap,) = ownership.overlapping
     assert overlap.identity[1] == "text"
-    assert ownership.supersession_witnesses == ()
     (update_op,) = candidate.edit_operations
     forged_owner = OwnedChange(
         identity=overlap.identity,
@@ -948,81 +837,30 @@ def test_witnessless_content_overlap_forced_into_intended_is_rejected() -> None:
         overlapping=(),
     )
     forged = replace(_reseal(candidate, tampered), push_safe=True)
-    with pytest.raises(cfxmark.ConversionError):
+    with pytest.raises(cfxmark.ConversionError, match="hides a migration owner"):
         cfxmark.validate_managed_cfx_artifact(forged, source_storage=storage, options=EDITABLE)
 
 
-def test_emoticon_overlap_produces_no_supersession_witness() -> None:
-    # A content-transform overlap is never witness-eligible: the migration code is
-    # not a structural reshape and the user op edits the value in place.
+def test_missing_fresh_ownership_proof_fails_closed() -> None:
+    """A missing independent verifier result is not evidence that there are no
+    migration owners. The source-bound preflight must reject it before PUT."""
+
+    from cfxmark.ownership_proof import _verify_no_hidden_migration_owners
+
+    candidate = _candidate("<p>source</p>", "source edited\n")
+    assert candidate.ownership_proof is not None
+    fresh_without_proof = replace(candidate, ownership_proof=None)
+
+    with pytest.raises(cfxmark.ConversionError, match="without an independent proof"):
+        _verify_no_hidden_migration_owners(
+            artifact=candidate,
+            fresh_candidate=fresh_without_proof,
+        )
+
+
+def test_content_migration_overlap_remains_fatal() -> None:
     storage = '<p><ac:emoticon ac:name="smile"/></p>'
     candidate = _candidate(storage, "changed\n")
     proof = _proof(candidate)
-    assert proof.blocking_code == "migration-user-overlap-ambiguous"
-    assert proof.supersession_witnesses == ()
-
-
-def test_content_transform_adjacent_topology_overlap_is_not_witnessed() -> None:
-    # A leading empty paragraph (structurally droppable) sits before an emoticon
-    # paragraph. Deleting the blank line and rewriting the emoticon text is a real
-    # content conflict that surfaces on a topology leaf whose migration owner is a
-    # CONTENT transform (emoticon-to-unicode), not a structural reshape. The code
-    # gate must refuse to witness it, so the candidate stays fatal.
-    storage = '<p /><p><ac:emoticon ac:name="smile"/></p>'
-    base = _full_migration_base(storage)
-    edited = _delete_leading_br(base.markdown).replace("🙂", "changed")
-    candidate = cfxmark.to_cfx_artifact(
-        edited,
-        presentation=base.presentation,
-        base_artifact=base,
-        splice_source=storage,
-        options=EDITABLE,
-    )
-    proof = _proof(candidate)
     assert candidate.push_safe is False
     assert proof.blocking_code == "migration-user-overlap-ambiguous"
-    # The overlap stays on a topology leaf owned by the emoticon content transform.
-    assert any(change.identity[1] == "topology" for change in proof.overlapping)
-    # Every minted witness is a delete over a topology leaf; the emoticon-owned
-    # topology overlap is never among them (its migration code is not structural).
-    assert all(witness.final_leaf[1] == "topology" for witness in proof.supersession_witnesses)
-    assert all(witness.tombstone_kind == "delete" for witness in proof.supersession_witnesses)
-    overlap_identities = {change.identity for change in proof.overlapping}
-    witnessed_identities = {witness.final_leaf for witness in proof.supersession_witnesses}
-    assert overlap_identities & witnessed_identities == set()
-
-
-def test_witness_user_operation_is_always_a_real_delete() -> None:
-    # The witness is deliberately delete-only: a relocation would leave the
-    # migration-created C0 node alive elsewhere in C1, a separate ownership
-    # question. Pin the contract against the actual operation objects, not just the
-    # witness field -- every witness must name a real edit operation whose kind is
-    # "delete" and whose deleted tombstones cover the dissolved leaf.
-    candidate = _witnessed_candidate()
-    proof = _proof(candidate)
-    assert proof.supersession_witnesses  # the fixture does mint one
-    operations = {operation_id(operation): operation for operation in candidate.edit_operations}
-    for witness in proof.supersession_witnesses:
-        assert witness.tombstone_kind == "delete"
-        operation = operations[witness.user_operation_id]
-        assert operation.kind == "delete"
-        deleted = {
-            (tombstone.semantic_path, tombstone.field, tombstone.attribute_name, tombstone.occurrence_ordinal)
-            for tombstone in operation.deleted_leaf_tombstones
-        }
-        assert witness.final_leaf in deleted
-
-
-def test_duplicate_supersession_witness_for_one_leaf_is_rejected() -> None:
-    # A forged witness paired with the valid one for the SAME leaf must not slip
-    # through: the validator compares the exact canonical ordered tuple, not a
-    # final_leaf-keyed dict that would silently collapse the duplicate.
-    candidate = _witnessed_candidate()
-    ownership = _proof(candidate)
-    (valid,) = ownership.supersession_witnesses
-    forged = replace(valid, migration_occurrence_id="mig_occ_sha256:forged")
-    for pair in ((forged, valid), (valid, forged)):
-        tampered = replace(ownership, supersession_witnesses=pair)
-        artifact = _reseal(candidate, tampered)
-        with pytest.raises(cfxmark.ConversionError, match="duplicate final leaf"):
-            cfxmark.validate_managed_cfx_artifact(artifact, source_storage=_LEADING_EMPTY_PARA_MACRO, options=EDITABLE)

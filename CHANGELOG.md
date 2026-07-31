@@ -7,6 +7,179 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-08-01
+
+Correspondence a tie did not touch, a table parser that reads what it wrote, a
+preflight that finishes — and an empty paragraph that comes back the way it left.
+
+> **Upgrading: pulled Markdown changes shape for one construct.** A paragraph
+> stored as a bare `<p/>` now projects as `<!-- cfxmark:blank -->` instead of
+> `<br>`. Any managed file pulled with 0.5.1 that contains an empty paragraph
+> will not match a fresh pull, so its content hash moves and it needs re-pulling
+> before its next publish. `<p><br/></p>` pages are unaffected — that form still
+> projects as `<br>` and is still the default on the way back.
+
+### Known limitations
+
+- **A list marker on a *nested* list is not read back.** The renderer emits it as the
+  nested list's first line, directly under its parent item, where CommonMark folds it
+  into that paragraph as a lazy continuation; it is then dropped as an ordinary comment
+  and the item's `<p>` wrapper is lost. A blank line before the marker would fix the
+  emission.
+
+  **Fail-closed, not silent**: dropping the comment reports `html-comment-dropped`,
+  which is blocking, so `push_safe` is `False` and the managed path refuses rather than
+  publishing the changed shape. Top-level and blockquote lists are unaffected.
+
+### Added
+
+- **Two empty-paragraph forms, two spellings.** Confluence stores `<p/>` and
+  `<p><br/></p>` and renders them at different heights; Markdown had one token
+  for both, so the round trip collapsed them and picked `<p><br/></p>` for
+  either. The effect was not local: publishing an edit made anywhere on a page
+  retuned the spacing of every untouched `<p/>` on it, not only the region the
+  author edited. `<!-- cfxmark:blank -->` names the bare form, so both
+  now round-trip to themselves with **no diagnostic and nothing to consent to**.
+
+  `<p><br/></p>` stays the default deliberately: it is the form the platform's
+  own editor converges to, and flipping the default would have moved the view on
+  every browser-edited page instead. The marker is per occurrence, not one
+  document-level list of positions, so inserting or deleting a blank line
+  elsewhere cannot slide the restoration onto a different paragraph. It is
+  control syntax only as its own block — inside prose it stays an ordinary HTML
+  comment, and inside a fence it stays literal text.
+
+- **`OwnershipProofSummary.all_identities`** — every fatal leaf identity,
+  uncapped, with `top_identities` guaranteed to be its first page. Both are the
+  same value-free `(path, field, attribute, ordinal)` projection, so the ten-item
+  cap was never a safety boundary; it is a display budget for an error message.
+  A caller diagnosing *why* a corpus fails needs the whole set, and reading the
+  capped list silently turns "these documents share a cause" into "share it among
+  the first ten" — which is how one real grouping was reported wrong.
+
+- **A list may hold wrapped and bare items and survive saying so.** Storage
+  distinguishes `<li>a</li>` from `<li><p>a</p></li>` and CommonMark cannot spell
+  a list where the two are mixed, so the shape was lost and items nobody edited
+  came back rewrapped. A `<!-- cfxmark:list loose=… -->` marker names which items
+  storage had wrapped, and a three-way list — wrapped, bare, and multi-paragraph in
+  one list — round-trips exactly as well. An earlier note in this release's evidence
+  called that shape a remaining gap; measured against the shipped build it is
+  `markdown_lossless` with no findings, so the note was stale.
+
+### Removed
+
+- **The supersession-witness machinery.** It existed for exactly one situation:
+  dissolving the overlap between the `empty-paragraph-dropped` migration and a
+  user deleting that paragraph, and only where that overlap landed on a topology
+  leaf.
+
+  The marker removes that migration for the **bare** form only. An empty paragraph
+  carrying an attribute, or one inside a table cell, still produces an
+  `empty-paragraph-dropped` occurrence, because neither is in the marker's scope.
+
+  Migration/user overlaps also still arise from other codes — deleting three table
+  rows at once produces four topology overlaps and refuses with
+  `migration-user-overlap-ambiguous`. That is not a change: run against 0.5.1 and
+  0.6.0 side by side, the occurrence codes, `push_safe`, blocking code, overlap
+  identities and refusal message are identical. Those overlaps were never dissolved
+  by a witness on either version; they were always fail-closed. The census that
+  justifies this removal measured witness *production*, which is the narrower thing
+  the removal depended on, and `empty-paragraph-dropped` was its only source.
+  Deleting a styled empty paragraph, and deleting a leading bare one, also publish
+  identically on both versions.
+
+  Removed rather than left in place because a census over all eleven codes
+  `_ATOMIC_COMPOSE_ORDER` composes — public API only, with the user edit found by
+  mechanical search over every single-line and contiguous two-line deletion —
+  found `empty-paragraph-dropped` was its **sole** producer. The gate was a
+  hardcoded one-element allowlist, and its own comment said why it had to stay
+  that way: a content-bearing code there would let a genuine content conflict be
+  dissolved as a positional shift. So this is a mechanism whose cause is gone, not
+  one whose tests stopped running.
+
+  What replaces it is narrower and independent. `_verify_no_hidden_migration_owners`
+  rejects user attribution for any leaf fresh storage proves migration-owned, and
+  refuses outright when the independent proof is missing rather than treating an
+  absent verifier result as permission. A future structural migration therefore
+  fails closed until its ownership contract is deliberately redesigned.
+
+### Fixed
+
+- **The server's own default is not a finding in either direction.** A page whose
+  source omitted `ac:schema-version` was reported as losing something when
+  regeneration supplied the server's default — an addition, not a loss.
+
+- **An `equivalent` rule must now name the values it writes, not only the ones it
+  covers.** `AttributeRule.when_after` was enforced only when `when_before` covered
+  absence, so the registered `present "1" -> absent` rule — which is evidence that
+  Confluence re-supplies its own default — also graded `"1" -> "2"` and
+  `"1" -> "99-EVIL"` as `equivalent`, and therefore the page as
+  `markdown_lossless`: the verdict meaning there is nothing to disclose and nobody
+  to ask. `relation` said `present "1" -> absent` all along, but that field is prose
+  the validator never enforced. Both directions are now required to constrain the
+  written value, and the shipped rule names `absent` explicitly. This matters most
+  on the read-back path, where the "after" side is whatever the server returned.
+
+- **`platform_editor_canonicalization` is now registered with no producer.** The
+  verdict was added in this release for the empty paragraph, classified on
+  observed editor-save convergence rather than on appearance. The marker then
+  removed the divergence it was there to classify, so the rule and
+  `canonicalization_sites()` remain and no finding reaches them. Kept rather than
+  deleted: the scope predicate is the thing that identifies these nodes, and the
+  next platform canonicalization will want it. Recorded here so a reader does not
+  mistake silence for absence.
+
+### Fixed
+
+- **A dropped user mention is a loss, not a warning.** `[~alice] please review`
+  converts to ` please review` — the mention is removed outright. It was
+  reported through the warning channel, so a caller asking whether the body was
+  complete was told yes while a person's name had gone from it. `losses` now
+  carries it and the answer changes. Smart links and attachment references were
+  measured at the same time and round-trip exactly, so they are not refused.
+
+- **A code span now closes where CommonMark closes it.** Backslash escapes do
+  not work inside code spans, but the table pipe-ambiguity check applied the
+  text rule when looking for a span's closing delimiter. A span whose content
+  ended in a backslash had its real closer skipped, and the scan ran on far
+  enough to swallow the row's own cell delimiters and report them as an
+  ambiguous pipe — a page that could not be published at all, with a message
+  naming a pipe the Markdown did not contain.
+
+- **An unmatched backtick no longer hides the span after it.** The scan gave up
+  on the whole row, so a genuine later span was never examined.
+
+- **A backslash run behind a backtick cannot open a span.** Parity alone does
+  not decide it; mistletoe's opener also requires that the run not sit behind a
+  backtick. Without this, a clean row was refused outright.
+
+- **Macro identity survives a tie elsewhere in the document.** Identity carry ran
+  inside the same guarded block as candidate generation, so an ambiguity
+  anywhere raised before a single identity was applied and the retry rebuilt
+  from a document that never received them. A duplicate paragraph pair was
+  enough to strip the `macro-id` off every macro on the page.
+
+- **A tie is confined to the pairs that actually differ**, not to the whole run
+  of siblings it sits in. The exception carries the pairs identical across every
+  minimum-cost alignment; the pairs that genuinely differ stay unclaimed.
+
+- **The validator retry is narrowed to the call that can tie**, so the branch
+  cannot be entered with variables the presentation rebuild never bound.
+
+### Performance
+
+- **Preflight on a large table-heavy page: 356s → 32s.** `operation_id` sorts
+  and serialises an operation's tombstone arrays to hash, and the same operation
+  was asked for its ID over and over — 85,070 calls across 53,629 operations on
+  the page that prompted this. It is now computed at most once per operation and
+  cached on the operation itself. Three `set[EditOperation]` dedups became
+  ID-keyed maps for the same reason: hashing a dataclass carrying thousands of
+  tombstones re-answers what the ID already answered.
+
+  Nothing about the verdict moved: same candidate XHTML, same diagnostics, same
+  fatal proof, same unclassified count. The independent validator is unchanged.
+
+
 ## [0.5.1] — 2026-07-28
 
 Editable-Markdown repairs. Three classes of ordinary page become editable that

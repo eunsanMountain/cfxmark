@@ -21,6 +21,11 @@ StorageLeafField = Literal["text", "tail", "attribute", "element", "topology"]
 SourceKind = Literal["ast-node", "migration", "presentation", "protected-region"]
 EditKind = Literal["insert", "delete", "update", "move"]
 _MAX_ALIGNMENT_CELLS = 1_000_000
+#: Recovering the pairs a tie did not touch is worth two more walks of the
+#: matrix on the sibling runs real documents have, and is not worth it on the
+#: pathological ones the alignment budget above merely tolerates. Past this,
+#: no pair is claimed -- the same answer as before the recovery existed.
+_MAX_FORCED_PAIR_CELLS = 40_000
 
 
 class SourceMapError(ValueError):
@@ -30,9 +35,45 @@ class SourceMapError(ValueError):
 
 
 class SemanticMappingAmbiguous(SourceMapError):
-    """More than one minimum-cost semantic edit mapping exists."""
+    """More than one minimum-cost semantic edit mapping exists.
+
+    Still raised, so every caller fails closed exactly as before. What is new is
+    that the exception carries the mapping that *was* proven.
+
+    A tie is local: it is the alignment of one parent's residual children that
+    has two readings, not the document. Discarding the whole walk over it threw
+    away every correspondence established elsewhere, and measured across the
+    Story corpus that is where the large unclassified counts come from -- 2,298
+    leaves on one page, 863 on another, from a tie inside a single table.
+
+    `partial` holds the walk's result with the tied segments confined: no
+    correspondence is claimed inside them and every node in them is a delete or
+    an insert, which is what an undecided alignment honestly means. A caller that
+    can use less than a whole-document proof can take it; a caller that cannot
+    keeps failing closed by ignoring it.
+
+    Confinement is per pair, not per segment. A segment is only the run of
+    siblings between two exact anchors, so a tie between two identical
+    paragraphs used to take down every other sibling sharing that run -- a code
+    macro edited in the same run lost its `macro-id` even though it pairs the
+    same way in *both* readings. `forced_pairs` carries the pairs that are
+    identical across every minimum-cost alignment, which are proven on exactly
+    the criterion the unique case uses; the pairs that actually differ between
+    readings are the ambiguity and stay unclaimed.
+    """
 
     code = "semantic-mapping-ambiguous"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        partial: EditMatchResult | None = None,
+        forced_pairs: tuple[tuple[str, str], ...] = (),
+    ) -> None:
+        super().__init__(message)
+        self.partial = partial
+        self.forced_pairs = forced_pairs
 
 
 @dataclass(frozen=True)
@@ -137,6 +178,10 @@ class EditMatchResult:
     operations: tuple[EditOperation, ...]
     base_to_edited_source: Mapping[str, str]
     edited_source_to_stable: Mapping[str, str]
+    #: Parent pairs whose residual children had more than one minimum alignment.
+    #: Empty on every complete proof; non-empty only on the partial result that
+    #: rides out on `SemanticMappingAmbiguous`.
+    ambiguous_scopes: tuple[tuple[str | None, str | None], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -167,6 +212,34 @@ def stable_node_id(parent_stable_id: str | None, node_type: str, ordinal: int, f
 
 
 def operation_id(operation: EditOperation) -> str:
+    """The deterministic ID for this operation, computed at most once for it.
+
+    Computing it means sorting an operation's tombstone arrays and serialising
+    them to JSON to hash. On a page of tables an operation can carry thousands
+    of tombstones, and the same operation is asked for its ID many times over --
+    measured on a live page, 85,070 calls across 53,629 operations, and that
+    recomputation was the single largest cost in a 356-second preflight.
+
+    Cached on the operation itself rather than in a module-level map keyed by
+    `id()`: an object's identity is reused after it is collected, so such a map
+    can hand one operation's ID to a different operation that happens to land
+    at the same address. Here the cache lives and dies with the object it
+    describes.
+
+    Writing to `__dict__` directly is what makes this work on a frozen
+    dataclass, and it is invisible to equality and hashing, which are generated
+    from the declared fields.
+    """
+
+    cached: str | None = operation.__dict__.get("_operation_id")
+    if cached is not None:
+        return cached
+    value = _compute_operation_id(operation)
+    operation.__dict__["_operation_id"] = value
+    return value
+
+
+def _compute_operation_id(operation: EditOperation) -> str:
     """Create a deterministic ID for an edit operation and its tombstones."""
 
     tombstones = [
@@ -331,6 +404,7 @@ def match_edit_operations(base_nodes: Sequence[SemanticNode], edited_nodes: Sequ
     unmatched_edited_roots: set[str] = set()
     parent_queue: deque[tuple[str | None, str | None]] = deque([(None, None)])
     processed_parents: set[tuple[str | None, str | None]] = set()
+    ambiguous_scopes: list[tuple[tuple[str | None, str | None], str]] = []
 
     def match_pair(base_id: str, edited_id: str) -> None:
         previous_edited = base_to_edited.get(base_id)
@@ -371,13 +445,31 @@ def match_edit_operations(base_nodes: Sequence[SemanticNode], edited_nodes: Sequ
                 exact_base,
                 exact_edited,
             ):
-                pairs, deleted, inserted = _unique_minimum_alignment(
-                    base,
-                    edited,
-                    residual_base,
-                    residual_edited,
-                    pair,
-                )
+                try:
+                    pairs, deleted, inserted = _unique_minimum_alignment(
+                        base,
+                        edited,
+                        residual_base,
+                        residual_edited,
+                        pair,
+                    )
+                except SemanticMappingAmbiguous as tie:
+                    # Confined, not resolved. The walk carries on so the rest of
+                    # the document keeps its proven correspondence, and the raise
+                    # still happens -- once, at the end, with this scope named.
+                    #
+                    # Confined to the pairs that actually differ between the tied
+                    # readings, not to the whole run they sit in. A segment is
+                    # just the siblings between two exact anchors, so discarding
+                    # all of it also discarded pairs every optimal alignment
+                    # agreed on -- measurably, a macro edited beside two
+                    # identical paragraphs lost the identity it still owned.
+                    ambiguous_scopes.append((pair, str(tie)))
+                    pairs = tie.forced_pairs
+                    forced_base = {base_id for base_id, _ in pairs}
+                    forced_edited = {edited_id for _, edited_id in pairs}
+                    deleted = tuple(base_id for base_id in residual_base if base_id not in forced_base)
+                    inserted = tuple(edited_id for edited_id in residual_edited if edited_id not in forced_edited)
                 for base_id, edited_id in pairs:
                     match_pair(base_id, edited_id)
                 unmatched_base_roots.update(deleted)
@@ -412,11 +504,17 @@ def match_edit_operations(base_nodes: Sequence[SemanticNode], edited_nodes: Sequ
         unmatched_base_roots,
         unmatched_edited_roots,
     )
-    return EditMatchResult(
+    result = EditMatchResult(
         operations=operations,
         base_to_edited_source=MappingProxyType(dict(sorted(base_to_edited.items()))),
         edited_source_to_stable=MappingProxyType(dict(sorted(edited_to_stable.items()))),
+        ambiguous_scopes=tuple(scope for scope, _ in dict.fromkeys(ambiguous_scopes)),
     )
+    if ambiguous_scopes:
+        # Raised, as it always was. The difference is that the proof it could not
+        # complete travels with it instead of being thrown away.
+        raise SemanticMappingAmbiguous(ambiguous_scopes[0][1], partial=result)
+    return result
 
 
 def _build_leaf_maps(
@@ -447,7 +545,18 @@ def _build_leaf_maps(
         identity_value: tuple(sorted(leaves, key=_leaf_key)) for identity_value, leaves in sorted(reverse_sets.items())
     }
     for leaf, identity_value in sorted_forward.items():
-        if leaf not in reverse[identity_value]:
+        # Against the SET, not the sorted tuple beside it. `in` on a tuple is a
+        # linear scan, so this loop was quadratic in the leaves an identity owns,
+        # and every comparison it made was a generated dataclass `__eq__`.
+        #
+        # Measured on the 79-table document under cProfile: 670,429,362 calls to
+        # that `__eq__`, 45.2 s of the profile. `reverse_sets` already holds exactly
+        # the same leaves -- `reverse` is built from it, one sort later -- so this is
+        # the same assertion asked of the same data in constant time.
+        #
+        # The tuples stay: they are the public shape, ordered by `_leaf_key`, and
+        # callers index into them.
+        if leaf not in reverse_sets[identity_value]:
             raise AssertionError("internal source-map inverse is incomplete")
     return sorted_forward, reverse
 
@@ -655,6 +764,85 @@ def _tie_is_ownership_neutral(
     return True
 
 
+def _forced_pairs_across_optimal_alignments(
+    base: _Tree,
+    edited: _Tree,
+    base_ids: Sequence[str],
+    edited_ids: Sequence[str],
+    costs: Sequence[Sequence[int]],
+) -> tuple[tuple[str, str], ...]:
+    """Pairs that are identical in *every* minimum-cost alignment of this run.
+
+    A tie means the optimal alignments disagree, not that they disagree
+    everywhere. Two identical paragraphs may swap between readings while the
+    macro beside them pairs the same way in all of them; that macro's
+    correspondence is proven on the very criterion the unique case uses, and
+    throwing it away is what stripped identities off untouched nodes.
+
+    Every complete alignment path runs from (0,0) to (n,m), so it consumes each
+    base row exactly once. Collect the transitions that consume row `i` and lie
+    on *some* optimal path -- a transition is on one when the best cost through
+    it equals the best cost overall. If all of them are the same pairing, then
+    every optimal alignment makes that pairing, and no counting is needed.
+    Anything else stays unclaimed, which is what an undecided alignment means.
+
+    Bounded by its own budget, well under the alignment budget that let the run
+    get this far. This walks the matrix twice more, and on a page whose tie
+    spans hundreds of siblings that is real time spent to recover identities
+    for a publish that is going to be refused anyway. Returning nothing is not
+    a wrong answer here -- it is precisely the behaviour before this existed, so
+    the fallback is conservative rather than degraded.
+    """
+
+    rows = len(base_ids) + 1
+    columns = len(edited_ids) + 1
+    if rows * columns > _MAX_FORCED_PAIR_CELLS:
+        return ()
+
+    # Best cost from each cell to the end, the mirror of `costs`.
+    suffix = [[0] * columns for _ in range(rows)]
+    for base_index in range(rows - 2, -1, -1):
+        suffix[base_index][columns - 1] = suffix[base_index + 1][columns - 1] + 1
+    for edited_index in range(columns - 2, -1, -1):
+        suffix[rows - 1][edited_index] = suffix[rows - 1][edited_index + 1] + 1
+    for base_index in range(rows - 2, -1, -1):
+        for edited_index in range(columns - 2, -1, -1):
+            best = min(suffix[base_index + 1][edited_index] + 1, suffix[base_index][edited_index + 1] + 1)
+            base_node = base.nodes[base_ids[base_index]]
+            edited_node = edited.nodes[edited_ids[edited_index]]
+            if base_node.node_type == edited_node.node_type:
+                update_cost = 0 if _semantic_equality_key(base_node) == _semantic_equality_key(edited_node) else 1
+                best = min(best, suffix[base_index + 1][edited_index + 1] + update_cost)
+            suffix[base_index][edited_index] = best
+
+    total = costs[0][0] + suffix[0][0]
+    forced: list[tuple[str, str]] = []
+    for base_index in range(1, rows):
+        # Every optimal path consumes base row `base_index` exactly once, either
+        # by deleting it or by pairing it with one edited column.
+        consumers: set[int | None] = set()
+        for edited_index in range(columns):
+            if costs[base_index - 1][edited_index] + 1 + suffix[base_index][edited_index] == total:
+                consumers.add(None)  # deleted on some optimal path
+            if edited_index == 0:
+                continue
+            base_node = base.nodes[base_ids[base_index - 1]]
+            edited_node = edited.nodes[edited_ids[edited_index - 1]]
+            if base_node.node_type != edited_node.node_type:
+                continue
+            update_cost = 0 if _semantic_equality_key(base_node) == _semantic_equality_key(edited_node) else 1
+            through = costs[base_index - 1][edited_index - 1] + update_cost + suffix[base_index][edited_index]
+            if through == total:
+                consumers.add(edited_index)
+            if len(consumers) > 1:
+                break
+        if len(consumers) == 1:
+            only = next(iter(consumers))
+            if only is not None:
+                forced.append((base_ids[base_index - 1], edited_ids[only - 1]))
+    return tuple(forced)
+
+
 def _unique_minimum_alignment(
     base: _Tree,
     edited: _Tree,
@@ -724,7 +912,10 @@ def _unique_minimum_alignment(
             # forced delete/insert that must still be emitted to _build_operations
             # as a delete/insert. Dropping it here would be silent data loss.
             return (), tuple(base_ids), tuple(edited_ids)
-        raise SemanticMappingAmbiguous(f"minimum semantic edit mapping is tied under parent pair {parent_pair!r}")
+        raise SemanticMappingAmbiguous(
+            f"minimum semantic edit mapping is tied under parent pair {parent_pair!r}",
+            forced_pairs=_forced_pairs_across_optimal_alignments(base, edited, base_ids, edited_ids, costs),
+        )
 
     pairs: list[tuple[str, str]] = []
     deleted: list[str] = []

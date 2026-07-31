@@ -117,6 +117,84 @@ def test_escaped_backticks_with_pipe_in_table_are_not_a_code_span() -> None:
     assert "<td>y`</td>" in result.xhtml
 
 
+def test_code_span_ending_in_a_backslash_closes_where_it_closes() -> None:
+    """Backslash escapes do not work in code spans -- CommonMark says so.
+
+    Applying the escaped-backtick rule above while looking for a span's CLOSING
+    delimiter mislocated the end of any span whose content ends in a backslash:
+    the real closer was skipped as "escaped" and the scan ran on to the next
+    backtick, swallowing the row's own cell delimiters and reporting them as an
+    ambiguous pipe.
+
+    Measured on a live page, from a cell holding `<code>\\</code>` followed by
+    literal backticks. The page could not be published at all, and the message
+    sent the reader looking for a pipe to escape in Markdown that had none.
+
+    A later code span in the row is what makes it fire: the scan needs some
+    unescaped backtick to finally accept as the closer, and everything between
+    the two -- cell delimiters included -- becomes the "span contents". Without
+    one the scan just runs off the end and reports nothing, so a fixture with a
+    trailing plain cell passes either way and proves nothing.
+    """
+
+    markdown = "| A | B |\n| --- | --- |\n| cite `\\` here | `sha` |\n"
+    result = cfxmark.to_cfx(markdown, options=EDITABLE)
+
+    assert "<code>\\</code>" in result.xhtml
+    # Two cells, not one: the span closed where it should, so the delimiter
+    # between them stayed a delimiter.
+    assert "<code>sha</code>" in result.xhtml
+
+
+def test_a_real_unescaped_pipe_in_a_code_span_is_still_rejected() -> None:
+    """The narrowing above must not reopen what the check exists for. A span
+    that genuinely holds a bare pipe is still ambiguous and still refused."""
+
+    with pytest.raises(cfxmark.ParseError, match="unescaped pipe"):
+        cfxmark.to_cfx("| Header |\n| --- |\n| `a|b` |\n", options=EDITABLE)
+
+
+def test_an_unmatched_backtick_does_not_hide_the_span_after_it() -> None:
+    """An opener with no matching closer is literal text in CommonMark, not a
+    reason to stop reading the line.
+
+    The scan used to give up on the whole row, so a genuine later span was never
+    examined. Correcting the closer rule changed how backtick runs segment, which
+    put this row into the abandoning branch: it passed, and produced a two-cell
+    body row under a one-column header with the pipe splitting the cells -- no
+    code element, no diagnostic, silently wrong.
+
+    Found by review, not by the suite. The fixture written for the closer rule
+    only covered rows where every opener matched.
+    """
+
+    with pytest.raises(cfxmark.ParseError, match="unescaped pipe"):
+        cfxmark.to_cfx("| H |\n| --- |\n| ` ``x|\\`` |\n", options=EDITABLE)
+
+
+def test_a_backslash_run_after_a_backtick_does_not_open_a_span() -> None:
+    """Backslash parity alone does not decide whether a backtick can open.
+
+    mistletoe's opener is ``(?<!\\\\|`)(?:\\\\\\\\)*(`+)(?!`)``: the backslash run
+    must not itself sit behind a backtick. In ``` ``\\\\` ```, the final backtick
+    has EVEN parity, so parity says "can open" -- and the scan then opened a
+    span there, ran to a closer further along, and reported the cell delimiter
+    in between.
+
+    mistletoe reads no code element in that cell at all, so nothing was at
+    stake and the publish was refused anyway. A false positive blocks outright,
+    which is why it matters more than its rarity suggests.
+
+    Only reachable once the scan resumes past an unmatched opener rather than
+    abandoning the line, so it arrived with that fix rather than before it.
+    """
+
+    result = cfxmark.to_cfx("| H | I |\n| --- | --- |\n| ``\\\\` a|b` | ok |\n", options=EDITABLE)
+
+    assert "<code>" not in result.xhtml  # mistletoe sees none either
+    assert "<td>ok</td>" in result.xhtml
+
+
 def test_non_table_leading_pipe_with_code_pipe_is_not_rejected() -> None:
     result = cfxmark.to_cfx("| prose `a|b` only\n", options=EDITABLE)
 
@@ -236,3 +314,61 @@ def test_layout_comment_body_table_and_emoticon_are_not_silently_push_safe() -> 
         result = cfxmark.to_md(storage, options=EDITABLE)
         assert result.push_safe is False
         assert any(loss_fragment in loss for loss in result.losses)
+
+
+def test_a_span_that_appears_to_straddle_a_cell_boundary_is_refused() -> None:
+    """Deliberately conservative, and worth stating because it looks like a bug.
+
+    GFM splits a row on `|` before inline parsing, so `` | `a | b` | `` really is
+    three fields and the backticks really are literal. But a person reading that
+    Markdown sees a code span holding a pipe, and the two readings disagree about
+    what the document says. The check refuses rather than pick one, and the
+    message names the fix: write `\\|` if the pipe is literal.
+
+    So a cell-level reading calls this a false positive and it is not one -- it
+    is the ambiguity the check is named for. Recorded here because a differential
+    fuzz can be built on either reading and they give very different numbers.
+    """
+
+    with pytest.raises(cfxmark.ParseError, match="unescaped pipe"):
+        cfxmark.to_cfx("| H1 | H2 |\n| --- | --- |\n| `a | b` | c |\n", options=EDITABLE)
+
+
+def test_escaping_the_pipe_is_the_way_out_the_message_offers() -> None:
+    """A refusal whose advice does not work is worse than none. Taking it
+    produces the code span the author meant, in one cell."""
+
+    result = cfxmark.to_cfx("| H1 | H2 |\n| --- | --- |\n| `a \\| b` | c |\n", options=EDITABLE)
+
+    assert "<code>a | b</code>" in result.xhtml
+    assert "<td>c</td>" in result.xhtml
+
+
+def test_a_dropped_user_mention_is_a_loss_and_not_a_warning() -> None:
+    """A warning says the body reads differently. A loss says part of it is not
+    there. A user mention is removed outright, so it is the second.
+
+    Reported as a warning, it left the reading projection calling the body
+    complete while a person's name had vanished from it -- an agent summarising
+    the issue would never mention them, and nothing anywhere said why. That is
+    the exact silent-omission shape this project spent a Confluence corpus
+    removing, sitting unfixed on the Jira side.
+    """
+
+    result = cfxmark.from_jira_wiki("h2. Title\n\n[~alice] please review\n")
+
+    assert result.markdown is not None
+    assert "[~alice]" not in result.markdown  # it really is gone
+    assert any("user mention" in loss for loss in result.losses)
+    assert not any("user mention" in warning for warning in result.warnings)
+
+
+def test_a_link_and_a_plain_attachment_reference_survive_the_round_trip() -> None:
+    """The check must not become "Jira wiki is unsafe". Measured: a smart link
+    and a bare attachment reference come back byte-identical, so refusing them
+    would refuse bodies nothing happens to."""
+
+    for wiki in ("[see this|https://example.test/x]\n", "!diagram.png!\n"):
+        markdown = cfxmark.from_jira_wiki(wiki).markdown or ""
+        back = cfxmark.to_jira_wiki(markdown, input_format="markdown").jira_wiki or ""
+        assert back.strip() == wiki.strip(), wiki

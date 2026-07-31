@@ -269,7 +269,7 @@ def canonicalize_cfx(source: str) -> str:
     _promote_header_row_to_thead(root)
     _unwrap_divs_in_cells(root)
     _flatten_paragraphs_in_table_cells(root)
-    _flatten_singleton_paragraph_in_li(root)
+    _flatten_singleton_paragraph_in_mixed_li(root)
     _strip_trailing_breaks(root)
     _trim_inline_endpoints(root)
     _drop_empty_paragraphs(root)
@@ -710,6 +710,87 @@ def _is_cell_empty(cell: ET._Element) -> bool:
     return True
 
 
+def _flatten_singleton_paragraph_in_mixed_li(root: ET._Element) -> None:
+    """Erase the ``<li><p>X</p></li>`` wrapper only where Markdown cannot carry it.
+
+    Canonicalization exists to say that a difference the format cannot express is
+    not a difference. That used to apply to every list item, because both forms
+    spelled as ``- x``. It no longer does: a list whose items are *all* wrapped
+    is a loose list and one whose items are all bare is a tight list, and
+    CommonMark distinguishes them.
+
+    What has no spelling is a list that mixes the two. There is no way to write
+    "these two items are paragraphs and that one is not", so for a mixed list --
+    and only a mixed list -- the wrapper is dropped from both sides before
+    comparing. The compatibility registry still reports it, so a user is told
+    what the shape costs rather than having it quietly declared equal.
+    """
+
+    for parent in list(root.iter()):
+        if not isinstance(parent.tag, str) or strip_ns(parent.tag) not in {"ul", "ol"}:
+            continue
+        items = [child for child in parent if isinstance(child.tag, str) and strip_ns(child.tag) == "li"]
+        wrapped = [item for item in items if _singleton_paragraph_child(item) is not None]
+        if not wrapped or len(wrapped) == len(items):
+            continue
+        for item in items:
+            # `is not None`, not `or`: an lxml element with no child elements is
+            # falsy, and `<p>text</p>` has none -- so `or` skipped the very case
+            # this was written for and fell through to the other shape.
+            paragraph = _singleton_paragraph_child(item)
+            if paragraph is None:
+                paragraph = _leading_paragraph_before_lists(item)
+            if paragraph is not None:
+                _promote_paragraph_into_li(item, paragraph)
+
+
+def _singleton_paragraph_child(li: ET._Element) -> ET._Element | None:
+    """The lone ``<p>`` that is this item's whole body, if there is one."""
+
+    if li.text and li.text.strip():
+        return None
+    children = list(li)
+    if len(children) != 1:
+        return None
+    paragraph = children[0]
+    if not isinstance(paragraph.tag, str) or strip_ns(paragraph.tag) != "p":
+        return None
+    if paragraph.tail and paragraph.tail.strip():
+        return None
+    return paragraph
+
+
+def _leading_paragraph_before_lists(li: ET._Element) -> ET._Element | None:
+    """A first-child ``<p>`` followed only by nested lists.
+
+    The other shape a mixed list can take and Markdown cannot spell: written out
+    and read back, the nested list's own lines make CommonMark call the whole
+    list loose, so the leading text returns wrapped. Reduced on both sides for
+    the same reason the singleton case is.
+    """
+
+    if li.text and li.text.strip():
+        return None
+    children = list(li)
+    if len(children) < 2:
+        return None
+    first = children[0]
+    if not isinstance(first.tag, str) or strip_ns(first.tag) != "p":
+        return None
+    if first.tail and first.tail.strip():
+        return None
+    if not all(isinstance(child.tag, str) and strip_ns(child.tag) in {"ul", "ol"} for child in children[1:]):
+        return None
+    return first
+
+
+def _promote_paragraph_into_li(li: ET._Element, paragraph: ET._Element) -> None:
+    li.text = paragraph.text
+    li.remove(paragraph)
+    for index, child in enumerate(list(paragraph)):
+        li.insert(index, child)
+
+
 def _strip_trailing_breaks(root: ET._Element) -> None:
     """Drop trailing ``<br/>`` elements from cells, headings, and ``<p>``.
 
@@ -942,69 +1023,6 @@ def _is_block_container(element: ET._Element) -> bool:
 
 
 _VOLATILE_HTML_ATTRS = frozenset({"data-uuid", "data-macro-id"})
-
-
-def _flatten_singleton_paragraph_in_li(root: ET._Element) -> None:
-    """Treat ``<li><p>X</p></li>`` and ``<li>X</li>`` as equivalent.
-
-    Confluence's editor flips between the two forms unpredictably.
-    Both versions canonicalize to the wrapped form ``<li><p>X</p></li>``
-    so the round-trip can ignore the difference.
-
-    Actually we go the other way — strip the wrapper — because that
-    matches the form our renderer emits for tight list items.
-    """
-
-    for li in list(root.iter()):
-        if not isinstance(li.tag, str):
-            continue
-        if strip_ns(li.tag) != "li":
-            continue
-        # Only flatten when the entire li body is a single <p> with
-        # no leading or trailing text on the li itself.
-        if li.text and li.text.strip():
-            continue
-        children = list(li)
-        if len(children) != 1:
-            continue
-        p = children[0]
-        if not isinstance(p.tag, str) or strip_ns(p.tag) != "p":
-            continue
-        if p.tail and p.tail.strip():
-            continue
-        # Promote <p>'s contents up to <li>.
-        li.text = p.text
-        li.remove(p)
-        for inner_child in p:
-            li.append(inner_child)
-    # Also flatten when the li starts with a <p> followed by other
-    # block elements (e.g. nested lists). The leading <p> can be
-    # safely flattened in that case as well.
-    for li in list(root.iter()):
-        if not isinstance(li.tag, str):
-            continue
-        if strip_ns(li.tag) != "li":
-            continue
-        children = list(li)
-        if not children:
-            continue
-        first = children[0]
-        if not isinstance(first.tag, str) or strip_ns(first.tag) != "p":
-            continue
-        if first.tail and first.tail.strip():
-            continue
-        if li.text and li.text.strip():
-            continue
-        # Only flatten when remaining children are all block-level.
-        rest = children[1:]
-        if not all(isinstance(c.tag, str) and _is_block(c) for c in rest):
-            continue
-        # Carry the <p>'s text into li.text and prepend its children.
-        li.text = first.text
-        first_children = list(first)
-        li.remove(first)
-        for j, ic in enumerate(first_children):
-            li.insert(j, ic)
 
 
 def _unwrap_decorative_spans(element: ET._Element) -> None:

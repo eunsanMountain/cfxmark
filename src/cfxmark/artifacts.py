@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 from collections import Counter, defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, TypeGuard, cast
@@ -31,6 +32,7 @@ from cfxmark.diagnostics import (
     make_diagnostic,
 )
 from cfxmark.exceptions import (
+    MAX_SUMMARY_IDENTITIES,
     PUBLIC_CONVERSION_REASON_CODES,
     ConversionError,
     DiagnosticSummary,
@@ -501,13 +503,18 @@ def _validate_cfx_artifact_core(
     )
     if ownership.artifacts.attribution_witness_sha256 != witness_sha256:
         raise ConversionError("candidate ownership proof is not bound to its attribution witness")
+    # Outside the retry below, deliberately. Only `candidate_maps` can tie, and
+    # leaving these inside meant the except branch could be entered with
+    # `presentation_occurrences` never bound -- an AttributeError standing in
+    # for a diagnostic, in the one path whose job is to explain a refusal.
+    independent_document, _presentation_messages, presentation_occurrences = apply_presentation_with_authority(
+        artifact.document,
+        artifact.ownership_presentation_authority,
+    )
+    if independent_document != artifact.document:
+        raise ConversionError("candidate presentation cannot be independently reconstructed")
+
     try:
-        independent_document, _presentation_messages, presentation_occurrences = apply_presentation_with_authority(
-            artifact.document,
-            artifact.ownership_presentation_authority,
-        )
-        if independent_document != artifact.document:
-            raise ConversionError("candidate presentation cannot be independently reconstructed")
         (
             independent_semantic_nodes,
             independent_operation_to_storage,
@@ -526,9 +533,56 @@ def _validate_cfx_artifact_core(
             attachment_filename_map=artifact.ownership_attachment_filename_map,
             presentation_occurrences=presentation_occurrences,
         )
-    except SemanticMappingAmbiguous as error:
-        reason_code = error.code if error.code in PUBLIC_CONVERSION_REASON_CODES else None
-        raise ConversionError(f"{error.code}: {error}", reason_code=reason_code) from error
+    except SemanticMappingAmbiguous as ambiguity:
+        # The generator does not stop here. On a tie it retries `candidate_maps`
+        # with the base and the confined correspondence the tie left behind, and
+        # returns *that* candidate, carrying a blocking
+        # `semantic-mapping-ambiguous` diagnostic. Raising instead of repeating
+        # the retry left this validator unable to reconstruct the very artifact
+        # the generator had just produced -- so a tie anywhere in a document
+        # turned a candidate whose proof is fatal into no candidate at all.
+        #
+        # The retry below must keep mirroring the generator exactly. It once
+        # dropped the base here, and that asymmetry is the defect this comment
+        # used to describe: the two sides then derived different candidates from
+        # the same input, and the divergence check below compared a candidate
+        # against something the generator had never produced.
+        #
+        # Measured on a live page: `to_cfx_artifact` returned a 16832-byte
+        # ManagedCfxArtifact with `push_safe=False`, and this call raised
+        # `ConversionError` on the same input.
+        #
+        # Reconstructing it decides nothing about publishing. The artifact keeps
+        # its blocking diagnostic and its fatal ownership proof, and every
+        # comparison below still runs against what the generator produced, so a
+        # genuine divergence is still caught. What changes is that the caller
+        # receives a candidate it can inspect instead of an exception it cannot.
+        try:
+            (
+                independent_semantic_nodes,
+                independent_operation_to_storage,
+                _independent_storage_to_operation,
+                independent_edit_operations,
+                independent_xhtml,
+                _independent_attachments,
+                _independent_warnings,
+                independent_source_map_entries,
+                _independent_unmapped,
+            ) = candidate_maps(
+                independent_document,
+                base_nodes=artifact.ownership_base_semantic_nodes,
+                base_source_map_entries=artifact.ownership_base_source_map_entries,
+                registry=macros,
+                attachment_filename_map=artifact.ownership_attachment_filename_map,
+                presentation_occurrences=presentation_occurrences,
+                accept_partial_correspondence=True,
+            )
+        except Exception as error:
+            reason_code = ambiguity.code if ambiguity.code in PUBLIC_CONVERSION_REASON_CODES else None
+            raise ConversionError(
+                "candidate attribution cannot be independently reconstructed",
+                reason_code=reason_code,
+            ) from error
     except ConversionError:
         raise
     except Exception as error:
@@ -732,9 +786,6 @@ def validate_cfx_artifact(
     _validate_cfx_artifact_core(artifact, source_storage=source_storage, macros=macros)
 
 
-_MAX_SUMMARY_IDENTITIES = 10
-
-
 def _ownership_proof_summary(
     proof: OwnershipResult,
     diagnostics: tuple[ConversionDiagnostic, ...],
@@ -752,7 +803,11 @@ def _ownership_proof_summary(
         if change.identity not in seen:
             seen.add(change.identity)
             ordered_identities.append(change.identity)
-    top_identities = tuple(sorted(ordered_identities)[:_MAX_SUMMARY_IDENTITIES])
+    # Sorted once, then paged. `top_identities` was previously sorted independently,
+    # which is the same answer today and would stop being one the moment either side
+    # gained a tiebreak the other did not.
+    all_identities = tuple(sorted(ordered_identities))
+    top_identities = all_identities[:MAX_SUMMARY_IDENTITIES]
 
     diagnostic_summaries: list[DiagnosticSummary] = []
     seen_diagnostics: set[tuple[str, str, int | None]] = set()
@@ -777,6 +832,7 @@ def _ownership_proof_summary(
         overlap_count=len(proof.overlapping),
         top_identities=top_identities,
         diagnostics=tuple(diagnostic_summaries),
+        all_identities=all_identities,
     )
 
 
@@ -812,6 +868,7 @@ def validate_managed_cfx_artifact(
         to_cfx_artifact,
         to_md_artifact,
     )
+    from cfxmark.compatibility import assess_candidate
 
     assert artifact.ownership_options_sha256 is not None
     assert artifact.ownership_options is not None
@@ -822,23 +879,39 @@ def validate_managed_cfx_artifact(
 
     fresh_base = to_md_artifact(source_storage, options=options, macros=macros)
     migration_base = replace(fresh_base, protected_regions=(), remote_subtrees=())
+    assert artifact.ownership_remote_subtrees is not None
+    claimed_remote_paths = {tuple(subtree.remote_node_path) for subtree in artifact.ownership_remote_subtrees}
+    capability_base = replace(
+        fresh_base,
+        protected_regions=tuple(
+            region for region in fresh_base.protected_regions if tuple(region.remote_node_path) in claimed_remote_paths
+        ),
+        remote_subtrees=tuple(
+            subtree for subtree in fresh_base.remote_subtrees if tuple(subtree.remote_node_path) in claimed_remote_paths
+        ),
+    )
     assert artifact.ownership_presentation_authority is not None
-    # Two derivations are valid, both deterministic functions of fresh storage:
-    # the splice path computes the authority against the base with its protected
-    # regions intact, while the managed full-migration path strips protected
-    # regions and remote subtrees before building the candidate.
-    expected_presentation_authority = _presentation_without_protected_tables(fresh_base.presentation, fresh_base)
-    stripped_presentation_authority = _presentation_without_protected_tables(fresh_base.presentation, migration_base)
-    if artifact.ownership_presentation_authority not in (
-        expected_presentation_authority,
-        stripped_presentation_authority,
-    ):
+    # Every accepted derivation is reconstructed from fresh storage. Besides the
+    # full splice and fully stripped migration bases, a registered caller may keep
+    # only the authenticated remote subtrees its capability covers. The artifact's
+    # attribution witness commits to that exact subset; the replay below must match
+    # it byte-for-byte.
+    bases: list[MarkdownArtifact] = []
+    for base in (fresh_base, migration_base, capability_base):
+        if base not in bases:
+            bases.append(base)
+    bases = [
+        base
+        for base in bases
+        if _presentation_without_protected_tables(fresh_base.presentation, base)
+        == artifact.ownership_presentation_authority
+    ]
+    if not bases:
         raise ConversionError("publish preflight presentation authority does not match fresh source storage")
     assert artifact.ownership_baseline_source_map_entries is not None
     assert artifact.ownership_baseline_semantic_nodes is not None
     assert artifact.ownership_baseline_matches_source_storage is not None
-    matching_bases: list[MarkdownArtifact] = []
-    bases = (fresh_base,) if migration_base == fresh_base else (fresh_base, migration_base)
+    matching_replays: list[tuple[MarkdownArtifact, CfxArtifact]] = []
     for base in bases:
         replayed = _to_cfx_artifact_core(
             base.markdown,
@@ -855,8 +928,8 @@ def validate_managed_cfx_artifact(
             and (replayed.xhtml == source_storage) == artifact.ownership_baseline_matches_source_storage
             and artifact.ownership_proof.artifacts.baseline_candidate_sha256 == baseline_sha256
         ):
-            matching_bases.append(base)
-    if not matching_bases:
+            matching_replays.append((base, replayed))
+    if not matching_replays:
         raise ConversionError("publish preflight baseline witness does not match fresh C0 replay")
 
     # Re-derive the source-side report entries and migration ownership from
@@ -867,9 +940,34 @@ def validate_managed_cfx_artifact(
     # hide a disclosed source loss while preserving a self-consistent envelope.
     assert artifact.source_migration_report is not None
     expected_migration_signature = _migration_owner_signature(artifact.ownership_proof.migration)
+
+    def replay_has_no_ownable_change(replayed: CfxArtifact) -> bool:
+        if replayed.xhtml == source_storage:
+            return True
+        comparison = assess_candidate(source_storage, replayed.xhtml)
+        return all(judgement.verdict == "equivalent" for judgement in comparison.judgements)
+
+    if (
+        not expected_migration_signature
+        and not artifact.source_migration_report.occurrences
+        and any(
+            not base.diagnostics
+            and not collateral_diagnostics(source_storage, replayed.xhtml)
+            and replay_has_no_ownable_change(replayed)
+            for base, replayed in matching_replays
+        )
+    ):
+        # The independently replayed C0 is either byte-identical to fresh S0 or
+        # differs only by comparator-proven equivalent normalization. There is
+        # therefore no S0->C0 change for a migration owner to hide or for a user
+        # operation to steal. The general path below rebuilds a complete
+        # source-bound proof because non-empty or non-equivalent migrations need
+        # that attribution; doing so here asks the same empty question several
+        # more times on large pages without adding a safety claim.
+        return
     migration_witness_matches = False
     matched_fresh_candidate: CfxArtifact | None = None
-    for base in matching_bases:
+    for base, _replayed in matching_replays:
         fresh_candidate = to_cfx_artifact(
             base.markdown,
             presentation=base.presentation,
@@ -893,13 +991,10 @@ def validate_managed_cfx_artifact(
             for occurrence_id, occurrence in replayed_occurrences.items()
         ):
             continue
-        # Subset, not equality: a user may edit away a migration-introduced leaf
-        # (delete the empty-paragraph <br> the round-trip produced), so a
-        # migration change realised in a no-edit C0 need not survive into the
-        # edited C1. Every migration ownership the artifact DOES claim must still
-        # reproduce from fresh S0, which forbids forging migration ownership; a
-        # dropped one cannot hide a loss because the final diff must still be
-        # covered by migration or a real user operation or it is unclassified.
+        # Subset, not equality: an edited C1 need not retain every migration leaf
+        # realised in a no-edit C0. Every migration ownership the artifact DOES
+        # claim must reproduce from fresh S0. The independent check below rejects
+        # re-labelling any omitted fresh migration leaf as a user-owned edit.
         if expected_migration_signature <= _migration_owner_signature(fresh_candidate.ownership_proof.migration):
             migration_witness_matches = True
             matched_fresh_candidate = fresh_candidate
@@ -909,15 +1004,14 @@ def validate_managed_cfx_artifact(
             "publish preflight source migration report or ownership does not match fresh source storage"
         )
 
-    # Independently re-derive every supersession witness from fresh S0 and reject
-    # any user attribution that hides a migration owner without one.
-    from cfxmark.ownership_proof import _verify_supersession_witnesses
+    # Fresh storage remains authoritative about migration ownership. No
+    # production migration may be re-labelled as a user edit.
+    from cfxmark.ownership_proof import _verify_no_hidden_migration_owners
 
     assert matched_fresh_candidate is not None
-    _verify_supersession_witnesses(
+    _verify_no_hidden_migration_owners(
         artifact=artifact,
         fresh_candidate=matched_fresh_candidate,
-        source_storage=source_storage,
     )
 
 
@@ -948,31 +1042,55 @@ def _element_at_storage_path(root: ET._Element, path: tuple[str, ...]) -> ET._El
     return current
 
 
-def _semantic_value(value: Any) -> Any:
+def _semantic_value(value: Any, cache: dict[int, Any] | None = None) -> Any:
     if isinstance(value, Enum):
         return value.value
     if isinstance(value, Node):
-        return {
+        key = id(value)
+        if cache is not None and key in cache:
+            return cache[key]
+        node_result = {
             "type": type(value).__name__,
             "fields": {
-                item.name: _semantic_value(getattr(value, item.name))
+                item.name: _semantic_value(getattr(value, item.name), cache)
                 for item in fields(value)
                 if _is_semantic_field(value, item.name)
             },
         }
+        if cache is not None:
+            cache[key] = node_result
+        return node_result
     if is_dataclass(value):
-        return {item.name: _semantic_value(getattr(value, item.name)) for item in fields(value)}
+        key = id(value)
+        if cache is not None and key in cache:
+            return cache[key]
+        dataclass_result = {item.name: _semantic_value(getattr(value, item.name), cache) for item in fields(value)}
+        if cache is not None:
+            cache[key] = dataclass_result
+        return dataclass_result
     if isinstance(value, tuple):
-        return [_semantic_value(item) for item in value]
+        key = id(value)
+        if cache is not None and key in cache:
+            return cache[key]
+        tuple_result = [_semantic_value(item, cache) for item in value]
+        if cache is not None:
+            cache[key] = tuple_result
+        return tuple_result
     return value
 
 
-def _subtree_fingerprint(node: Node) -> str:
-    payload = json.dumps(_semantic_value(node), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+def _subtree_fingerprint(node: Node, semantic_cache: dict[int, Any] | None = None) -> str:
+    payload = json.dumps(
+        _semantic_value(node, semantic_cache), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
     return fingerprint_semantic_value(payload)
 
 
-def _direct_leaves(node: Node, path: tuple[str, ...]) -> tuple[StorageLeafRef, ...]:
+def _direct_leaves(
+    node: Node,
+    path: tuple[str, ...],
+    semantic_cache: dict[int, Any] | None = None,
+) -> tuple[StorageLeafRef, ...]:
     leaves: list[StorageLeafRef] = []
     ordinal = 0
     for item in fields(node):
@@ -983,7 +1101,12 @@ def _direct_leaves(node: Node, path: tuple[str, ...]) -> tuple[StorageLeafRef, .
             continue
         if value is None or value == ():
             continue
-        serialized = json.dumps(_semantic_value(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        serialized = json.dumps(
+            _semantic_value(value, semantic_cache),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         field_kind: Literal["text", "tail", "attribute", "element", "topology"] = "attribute"
         if item.name in {"content", "code"}:
             field_kind = "text"
@@ -1012,9 +1135,9 @@ def _direct_leaves(node: Node, path: tuple[str, ...]) -> tuple[StorageLeafRef, .
     return tuple(leaves)
 
 
-def _local_fingerprint(node: Node) -> str:
+def _local_fingerprint(node: Node, semantic_cache: dict[int, Any] | None = None) -> str:
     values = {
-        item.name: _semantic_value(value)
+        item.name: _semantic_value(value, semantic_cache)
         for item in fields(node)
         if _is_semantic_field(node, item.name)
         if not isinstance((value := getattr(node, item.name)), Node)
@@ -1082,9 +1205,10 @@ def _semantic_snapshot_with_objects(
     entries: list[SourceMapEntry] = []
     object_to_node: dict[int, str] = {}
     object_values: dict[int, Node] = {}
+    semantic_cache: dict[int, Any] = {}
 
     def visit(node: Node, parent_id: str | None, ordinal: int, path: tuple[str, ...]) -> None:
-        fingerprint = _subtree_fingerprint(node)
+        fingerprint = _subtree_fingerprint(node, semantic_cache)
         node_type = type(node).__name__
         node_id = (
             stable_node_id(parent_id, node_type, ordinal, fingerprint)
@@ -1095,13 +1219,13 @@ def _semantic_snapshot_with_objects(
             ).hexdigest()
         )
         current_path = path + (f"{node_type}[{ordinal}]",)
-        leaves = _direct_leaves(node, current_path)
+        leaves = _direct_leaves(node, current_path, semantic_cache)
         topology = ""
         if node_type in {"Table", "TableRow", "TableCell", "List", "ListItem"}:
             topology = fingerprint_semantic_value(
                 json.dumps(
                     {
-                        item.name: _semantic_value(getattr(node, item.name))
+                        item.name: _semantic_value(getattr(node, item.name), semantic_cache)
                         for item in fields(node)
                         if item.name in {"kind", "colspan", "rowspan", "alignments", "ordered", "start"}
                     },
@@ -1116,7 +1240,7 @@ def _semantic_snapshot_with_objects(
             parent_id=parent_id,
             ordinal=ordinal,
             subtree_fingerprint=fingerprint,
-            local_fingerprint=_local_fingerprint(node),
+            local_fingerprint=_local_fingerprint(node, semantic_cache),
             topology_fingerprint=topology,
             leaves=leaves,
             payload_free=_subtree_payload_free(node),
@@ -1188,30 +1312,79 @@ def macro_identities(document: Document) -> tuple[MacroIdentity, ...]:
     )
 
 
+def _unique_by_operation_id(operations: Iterable[EditOperation]) -> dict[str, EditOperation]:
+    """Deduplicate operations by their ID rather than by the objects themselves.
+
+    `EditOperation` is a frozen dataclass whose fields include tombstone tuples,
+    and a delete on a large table can carry thousands of them. Putting such an
+    object in a `set` makes `__hash__` and `__eq__` walk that whole payload,
+    every time, to answer a question the operation's own ID already answers --
+    measured as the second largest cost in a 356-second preflight.
+
+    The ID is computed once per operation and cached on it, so this is a string
+    comparison. Returning the map rather than a set keeps the operations
+    reachable, since every caller wants the operation and not just the count.
+    """
+
+    unique: dict[str, EditOperation] = {}
+    for operation in operations:
+        unique.setdefault(operation_id(operation), operation)
+    return unique
+
+
 def apply_macro_identities(
     document: Document,
     *,
     identities: tuple[MacroIdentity, ...],
     base_nodes: tuple[SemanticNode, ...],
+    accept_partial_correspondence: bool = False,
 ) -> Document:
     """Reapply unique remote macro identities after Markdown parsing.
 
     Only nodes that ``match_edit_operations`` maps to exactly one base node get
     their identity back; copies and genuinely ambiguous correspondences are left
     to regenerate as new macros, so an ID is never duplicated or misattributed.
+
+    ``accept_partial_correspondence`` extends that same rule to a tie instead of
+    abandoning the document to it. A tie is one parent's residual children, but
+    the bare matcher raises for the whole walk, so a duplicate paragraph pair
+    anywhere used to strip the identity off every macro on the page -- measured
+    on a controlled pair, one unrelated tie turned a carried ``macro-id`` into a
+    regenerated one while the edit itself landed unchanged.
+
+    Taking the partial changes nothing inside the tied segment: it claims no
+    correspondence there, so those nodes still find no unique base node and
+    still regenerate. Only macros the walk *did* prove keep their identity.
+    Callers that cannot reason about a confined tie leave the default and keep
+    failing closed.
     """
 
     if not identities:
         return document
     edited_nodes, _entries, object_to_edited, object_values = _semantic_snapshot_with_objects(document, base=False)
-    correspondence = match_edit_operations(base_nodes, edited_nodes)
+    try:
+        correspondence = match_edit_operations(base_nodes, edited_nodes)
+    except SemanticMappingAmbiguous as error:
+        if not accept_partial_correspondence or error.partial is None:
+            raise
+        correspondence = error.partial
+    # Only pairings the matcher *proved*. `edited_source_to_stable` also holds
+    # ids synthesized for inserted nodes, and those are derived from content, so
+    # a node inserted as a byte-identical copy of a base node is handed that
+    # base node's stable id. Reading identities out of that map would reattach a
+    # remote `macro-id` to a duplicate the matcher deliberately refused to pair
+    # -- exactly the guess the whole mechanism exists to avoid. Inverting the
+    # proven map keeps copies and undecided nodes regenerating as new macros.
+    proven_stable_by_edited = {
+        edited_id: base_id for base_id, edited_id in correspondence.base_to_edited_source.items()
+    }
     identity_by_node = {item.node_id: item for item in identities}
     replacements: dict[int, Node] = {}
     for object_id, node in object_values.items():
         if not isinstance(node, (CodeBlock, DirectiveMacro, InlineDirectiveMacro)):
             continue
         edited_id = object_to_edited[object_id]
-        stable_id = correspondence.edited_source_to_stable.get(edited_id)
+        stable_id = proven_stable_by_edited.get(edited_id)
         identity = identity_by_node.get(stable_id or "")
         if identity is not None:
             replacements[object_id] = replace(
@@ -1324,6 +1497,43 @@ def base_maps(
     return nodes, storage_to_node, node_to_storage, entries, tuple(unmapped)
 
 
+def _minimal_semantic_paths(relocated: Iterable[Any]) -> tuple[tuple[Any, ...], ...]:
+    """The paths in `relocated` that no other path in it is an ancestor of.
+
+    Rewritten from a nested scan, and the rewrite is a reading of the condition
+    rather than a heuristic. The original asked, for each leaf:
+
+        keep it unless some `other` has a DIFFERENT path which is a prefix of mine
+
+    Two observations collapse that into a lookup. A path longer than mine cannot be
+    a prefix of mine -- `mine[:len(other)]` is just `mine`, which is shorter than
+    `other` and so cannot equal it. And a path the same length as mine that is also
+    a prefix of mine *is* mine, which the `!=` already excluded. So the only paths
+    that can exclude me are my own PROPER prefixes, and there are at most
+    `len(path)` of those.
+
+    Measured on a 79-table document under cProfile: 437,773,545 generator
+    calls and 66.7 s of the 286 s profile, because the scan is quadratic in the
+    number of relocated tombstones. The equality comparisons alone accounted for a
+    further 44.9 s -- 670 million calls to a generated dataclass `__eq__`.
+
+    Order and duplicates are preserved exactly. Callers use the result only for
+    membership (`any(... for prefix in shortest)`), so duplicates cannot change an
+    answer, but the release requires candidate bytes to be unchanged and the cheapest
+    way to guarantee that is to change nothing observable.
+    """
+
+    present = {leaf.semantic_path for leaf in relocated}
+    kept: list[tuple[Any, ...]] = []
+    for leaf in relocated:
+        path = leaf.semantic_path
+        # Proper prefixes only: `range` stops one short of the full path, which is
+        # what the original's `!=` did.
+        if not any(path[:index] in present for index in range(len(path))):
+            kept.append(path)
+    return tuple(kept)
+
+
 def candidate_maps(
     document: Document,
     *,
@@ -1332,6 +1542,10 @@ def candidate_maps(
     registry: Any | None = None,
     attachment_filename_map: tuple[tuple[str, str], ...] = (),
     presentation_occurrences: dict[int, str] | None = None,
+    #: Take the confined proof a tie leaves behind instead of failing.
+    #: Off by default: a caller that cannot reason about ambiguous scopes must
+    #: keep getting the exception.
+    accept_partial_correspondence: bool = False,
 ) -> tuple[
     tuple[SemanticNode, ...],
     dict[str, tuple[StorageLeafRef, ...]],
@@ -1351,7 +1565,17 @@ def candidate_maps(
         edited_to_stable = {node.node_id: node.node_id for node in nodes}
         delta: tuple[EditOperation, ...] = ()
     else:
-        result = match_edit_operations(base_nodes, nodes)
+        try:
+            result = match_edit_operations(base_nodes, nodes)
+        except SemanticMappingAmbiguous as error:
+            # Opt-in, and off by default so every existing caller keeps failing
+            # closed. A caller that asks for it gets the correspondence the walk
+            # did prove, with the tied scopes confined to deletes and inserts --
+            # which is what keeps a tie inside one table from discarding the
+            # attribution for the rest of the document.
+            if not accept_partial_correspondence or error.partial is None:
+                raise
+            result = error.partial
         edited_to_stable = dict(result.edited_source_to_stable)
         delta = result.operations
         if base_source_map_entries is not None:
@@ -1360,15 +1584,9 @@ def candidate_maps(
             for operation in delta:
                 relocated = operation.relocated_leaf_tombstones
                 if relocated:
-                    shortest = tuple(
-                        leaf.semantic_path
-                        for leaf in relocated
-                        if not any(
-                            other.semantic_path != leaf.semantic_path
-                            and leaf.semantic_path[: len(other.semantic_path)] == other.semantic_path
-                            for other in relocated
-                        )
-                    )
+                    shortest = _minimal_semantic_paths(relocated)
+                    shortest_set = frozenset(shortest)
+                    shortest_lengths = tuple(sorted({len(prefix) for prefix in shortest}))
                     relocated = tuple(
                         sorted(
                             {
@@ -1376,7 +1594,11 @@ def candidate_maps(
                                 *(
                                     leaf
                                     for leaf in source_leaves
-                                    if any(leaf.semantic_path[: len(prefix)] == prefix for prefix in shortest)
+                                    if any(
+                                        length <= len(leaf.semantic_path)
+                                        and leaf.semantic_path[:length] in shortest_set
+                                        for length in shortest_lengths
+                                    )
                                 ),
                             },
                             key=lambda leaf: (
@@ -1427,13 +1649,13 @@ def candidate_maps(
         stable_id = edited_to_stable[node.node_id]
         owner = delta_by_stable.get(stable_id)
         if owner is not None and owner.kind == "move" and operation_id(owner) not in canonical_move_ids:
-            canonical_siblings = {
+            canonical_siblings = _unique_by_operation_id(
                 sibling
                 for parent_id in {owner.old_parent_id, owner.new_parent_id} - {None}
                 for sibling in canonical_moves_by_parent.get(cast(str, parent_id), ())
-            }
+            )
             if len(canonical_siblings) == 1:
-                owner = canonical_siblings.pop()
+                owner = next(iter(canonical_siblings.values()))
         ancestor_edited_id = node.parent_id
         while owner is None and ancestor_edited_id is not None:
             ancestor_stable_id = edited_to_stable[ancestor_edited_id]
@@ -1443,13 +1665,13 @@ def candidate_maps(
                 and ancestor_owner.kind == "move"
                 and operation_id(ancestor_owner) not in canonical_move_ids
             ):
-                canonical_siblings = {
+                canonical_siblings = _unique_by_operation_id(
                     sibling
                     for parent_id in {ancestor_owner.old_parent_id, ancestor_owner.new_parent_id} - {None}
                     for sibling in canonical_moves_by_parent.get(cast(str, parent_id), ())
-                }
+                )
                 if len(canonical_siblings) == 1:
-                    ancestor_owner = canonical_siblings.pop()
+                    ancestor_owner = next(iter(canonical_siblings.values()))
             if ancestor_owner is not None and (ancestor_owner.kind in {"insert", "move"}):
                 owner = ancestor_owner
                 break
@@ -1462,13 +1684,13 @@ def candidate_maps(
             if before_node is not None and (
                 before_node.parent_id != after_node.parent_id or before_node.ordinal != after_node.ordinal
             ):
-                topology_owners = {
+                topology_owners = _unique_by_operation_id(
                     delta_by_stable[parent_id]
                     for parent_id in {before_node.parent_id, after_node.parent_id} - {None}
                     if parent_id in delta_by_stable and delta_by_stable[parent_id].topology_only
-                }
+                )
                 if len(topology_owners) == 1:
-                    owner = topology_owners.pop()
+                    owner = next(iter(topology_owners.values()))
                     break
             shifted_edited_id = nodes_by_edited_id[shifted_edited_id].parent_id
         if owner is None and base_children.get(stable_id) != stable_children.get(stable_id):

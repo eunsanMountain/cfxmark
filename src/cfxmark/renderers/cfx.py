@@ -222,8 +222,10 @@ def _render_inline(
             ctx.claim_leaf(el, "text", node)
             last_child = el
         elif isinstance(node, Link):
-            el = ctx.claim_element(ET.SubElement(parent, "a", {"href": node.url}), node)
-            ctx.claim_leaf(el, "attribute", node, attribute_name="href")
+            attributes = {"href": node.url} if node.href_present else {}
+            el = ctx.claim_element(ET.SubElement(parent, "a", attributes), node)
+            if node.href_present:
+                ctx.claim_leaf(el, "attribute", node, attribute_name="href")
             if node.title:
                 el.set("title", node.title)
                 ctx.claim_leaf(el, "attribute", node, attribute_name="title")
@@ -370,6 +372,8 @@ def _render_block(
         if block.align in {"left", "center", "right"}:
             el.set("style", f"text-align: {block.align};")
             ctx.claim_leaf(el, "attribute", block, attribute_name="style")
+        if block.bare_empty and len(block.children) == 1 and isinstance(block.children[0], HardBreak):
+            return el
         _render_inline(block.children, el, ctx)
         return el
     if isinstance(block, CodeBlock):
@@ -440,7 +444,8 @@ def _render_list(block: List, ctx: RenderContext) -> ET._Element:
         ctx.claim_leaf(el, "attribute", block, attribute_name="start")
     for item in block.items:
         li = ctx.claim_element(ET.SubElement(el, "li"), item)
-        _render_list_item_body(item, li, ctx)
+        # `item.loose` is how a mixed list survives: the list is tight and this item is not.
+        _render_list_item_body(item, li, ctx, loose=block.loose or item.loose)
     return el
 
 
@@ -448,6 +453,8 @@ def _render_list_item_body(
     item: ListItem,
     li: ET._Element,
     ctx: RenderContext,
+    *,
+    loose: bool = False,
 ) -> None:
     """Render a list item body using the tight or loose form.
 
@@ -455,14 +462,30 @@ def _render_list_item_body(
     children are a leading Paragraph followed by Lists only, or a single
     Paragraph. Anything more structural (multiple paragraphs, a code
     block, …) forces the loose form with each block wrapped in ``<p>``.
+
+    ``loose`` comes from the list, and overrides the shape-based guess above.
+    A single-paragraph item can be either form -- that is precisely CommonMark's
+    tight/loose distinction -- so the shape cannot decide it, and deciding by
+    shape alone unwrapped `<li><p>x</p></li>` on items nobody had edited.
     """
 
     children = list(item.children)
     if not children:
         return
 
-    if _is_tight_item(children):
-        # First child Paragraph → inlined; the rest are Lists.
+    # In a list the source said was tight, a leading paragraph is inlined even
+    # when blocks follow it -- `<li>text<ac:structured-macro/></li>` is a shape
+    # storage holds and this is the only way back to it. Reachable only for a
+    # list carrying the tight marker, since a loose list skips this branch
+    # entirely.
+    leading_bare_empty = (
+        isinstance(children[0], Paragraph)
+        and children[0].bare_empty
+        and len(children[0].children) == 1
+        and isinstance(children[0].children[0], HardBreak)
+    )
+    if not loose and not leading_bare_empty and (_is_tight_item(children) or _leads_with_text_then_blocks(children)):
+        # First child Paragraph → inlined; the rest follow as blocks.
         first = children[0]
         if isinstance(first, Paragraph):
             _render_inline(first.children, li, ctx)
@@ -478,11 +501,28 @@ def _render_list_item_body(
     for child in children:
         if isinstance(child, Paragraph):
             p = ctx.claim_element(ET.SubElement(li, "p"), child)
-            _render_inline(child.children, p, ctx)
+            if not (child.bare_empty and len(child.children) == 1 and isinstance(child.children[0], HardBreak)):
+                _render_inline(child.children, p, ctx)
         else:
             sub = _render_block(child, ctx)
             if sub is not None:
                 li.append(sub)
+
+
+def _leads_with_text_then_blocks(children: list[BlockNode]) -> bool:
+    """A leading paragraph followed by blocks that are not paragraphs.
+
+    `<li>text<ac:structured-macro/></li>` is a shape storage holds and this is the
+    only way back to it. Restricted to non-paragraph followers on purpose: an
+    item holding *two paragraphs* needs both of them wrapped, and inlining the
+    first turned a corpus page's `<li><p>a</p><p>b</p></li>` into
+    `<li>a<p>b</p></li>` -- a change to an item nobody edited, which is the exact
+    damage this whole change exists to stop.
+    """
+
+    if len(children) < 2 or not isinstance(children[0], Paragraph):
+        return False
+    return not any(isinstance(child, Paragraph) for child in children[1:])
 
 
 def _is_tight_item(children: list[BlockNode]) -> bool:

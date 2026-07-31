@@ -119,6 +119,15 @@ class StorageExtraction:
     entries: tuple[SourceMapEntry, ...]
     unmapped: tuple[StorageLeafRef, ...]
     ambiguous: tuple[StorageLeafRef, ...]
+    #: Every element the walk visited, paired with the semantic path it was given.
+    #:
+    #: Exists so that a rule which holds only in some contexts can ask the *tree*
+    #: rather than re-deriving positions from the path string. A second walk with
+    #: its own ordinal arithmetic is the shape that has already produced four
+    #: defects in this release: a check that inspects less than the operation acts
+    #: on. One walk, one numbering, and a scope predicate that reads the same
+    #: element the difference was measured from.
+    elements: tuple[tuple[tuple[str, ...], ET._Element], ...] = ()
 
 
 def _node_name(element: ET._Element) -> str:
@@ -159,6 +168,7 @@ def extract_storage(
     grouped: dict[OwnerToken, list[StorageLeafRef]] = defaultdict(list)
     unmapped: list[StorageLeafRef] = []
     ambiguous: list[StorageLeafRef] = []
+    visited: list[tuple[tuple[str, ...], ET._Element]] = []
 
     def emit(
         leaf: StorageLeafRef,
@@ -183,6 +193,7 @@ def extract_storage(
     def visit(element: ET._Element, current: tuple[str, ...], inherited_owner: OwnerToken | None) -> None:
         owner = ownership.element_owners.get(element, inherited_owner) if ownership is not None else None
         name = _node_name(element)
+        visited.append((current, element))
         emit(_leaf(current, "element", name), element, inherited_owner, "element")
         if not isinstance(element.tag, str):
             payload = element.text or ""
@@ -270,7 +281,7 @@ def extract_storage(
         )
         for owner, owner_leaves in sorted(grouped.items())
     )
-    return StorageExtraction(tuple(leaves), entries, tuple(unmapped), tuple(ambiguous))
+    return StorageExtraction(tuple(leaves), entries, tuple(unmapped), tuple(ambiguous), tuple(visited))
 
 
 def extract_storage_source(source: str) -> StorageExtraction:
