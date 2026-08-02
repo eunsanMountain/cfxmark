@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 from collections import Counter, defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, TypeGuard, cast
@@ -20,7 +20,9 @@ from cfxmark.ast import (
     Document,
     Image,
     InlineDirectiveMacro,
+    ListItem,
     Node,
+    Paragraph,
     TableCell,
 )
 from cfxmark.change_ownership import LeafIdentity, OwnershipResult
@@ -166,6 +168,7 @@ class MacroIdentity:
     node_id: str
     macro_id: str | None
     schema_version: str | None = None
+    kind: str = "macro"
 
 
 def _table_block_starts(lines: list[str]) -> list[int]:
@@ -341,6 +344,7 @@ class CfxArtifact:
     ownership_attachment_filename_map: tuple[tuple[str, str], ...] | None = None
     ownership_remote_subtrees: tuple[RemoteSubtreeArtifact, ...] | None = None
     ownership_presentation_authority: PresentationArtifact | None = None
+    ownership_markdown_authoritative_tables: bool | None = None
     ownership_options: ConversionOptions | None = None
     ownership_options_sha256: str | None = None
 
@@ -500,6 +504,7 @@ def _validate_cfx_artifact_core(
         remote_subtrees=artifact.ownership_remote_subtrees,
         presentation_authority=artifact.ownership_presentation_authority,
         options_sha256=artifact.ownership_options_sha256,
+        markdown_authoritative_tables=bool(artifact.ownership_markdown_authoritative_tables),
     )
     if ownership.artifacts.attribution_witness_sha256 != witness_sha256:
         raise ConversionError("candidate ownership proof is not bound to its attribution witness")
@@ -532,6 +537,7 @@ def _validate_cfx_artifact_core(
             registry=macros,
             attachment_filename_map=artifact.ownership_attachment_filename_map,
             presentation_occurrences=presentation_occurrences,
+            markdown_authoritative_tables=bool(artifact.ownership_markdown_authoritative_tables),
         )
     except SemanticMappingAmbiguous as ambiguity:
         # The generator does not stop here. On a tie it retries `candidate_maps`
@@ -575,6 +581,7 @@ def _validate_cfx_artifact_core(
                 registry=macros,
                 attachment_filename_map=artifact.ownership_attachment_filename_map,
                 presentation_occurrences=presentation_occurrences,
+                markdown_authoritative_tables=bool(artifact.ownership_markdown_authoritative_tables),
                 accept_partial_correspondence=True,
             )
         except Exception as error:
@@ -863,6 +870,7 @@ def validate_managed_cfx_artifact(
 
     from cfxmark.api import (
         _conversion_options_sha256,
+        _markdown_authoritative_table_presentation,
         _presentation_without_protected_tables,
         _to_cfx_artifact_core,
         to_cfx_artifact,
@@ -891,6 +899,7 @@ def validate_managed_cfx_artifact(
         ),
     )
     assert artifact.ownership_presentation_authority is not None
+    assert artifact.ownership_markdown_authoritative_tables is not None
     # Every accepted derivation is reconstructed from fresh storage. Besides the
     # full splice and fully stripped migration bases, a registered caller may keep
     # only the authenticated remote subtrees its capability covers. The artifact's
@@ -903,8 +912,16 @@ def validate_managed_cfx_artifact(
     bases = [
         base
         for base in bases
-        if _presentation_without_protected_tables(fresh_base.presentation, base)
-        == artifact.ownership_presentation_authority
+        if (
+            _markdown_authoritative_table_presentation(base, source_storage)
+            == artifact.ownership_markdown_authoritative_tables
+            and (
+                PresentationArtifact()
+                if artifact.ownership_markdown_authoritative_tables
+                else _presentation_without_protected_tables(fresh_base.presentation, base)
+            )
+            == artifact.ownership_presentation_authority
+        )
     ]
     if not bases:
         raise ConversionError("publish preflight presentation authority does not match fresh source storage")
@@ -920,6 +937,7 @@ def validate_managed_cfx_artifact(
             splice_source=source_storage,
             options=options,
             macros=macros,
+            markdown_authoritative_tables=artifact.ownership_markdown_authoritative_tables,
         )
         baseline_sha256 = "sha256:" + hashlib.sha256(replayed.xhtml.encode()).hexdigest()
         if (
@@ -1174,6 +1192,17 @@ _OWNERSHIP_NEUTRAL_NODE_TYPES = frozenset(
     }
 )
 
+_TIGHT_LIST_MARKDOWN_INLINE_NODE_TYPES = frozenset(
+    {
+        "Text",
+        "Strong",
+        "Emphasis",
+        "Strikethrough",
+        "InlineCode",
+        "Link",
+    }
+)
+
 
 def _subtree_payload_free(node: Node) -> bool:
     """True only if the node and every descendant is ownership-neutral.
@@ -1196,10 +1225,130 @@ def _subtree_payload_free(node: Node) -> bool:
     return True
 
 
+def _subtree_node_ids(children: Mapping[str | None, Iterable[str]], root_id: str) -> set[str]:
+    """Return one semantic subtree's stable node IDs."""
+
+    result: set[str] = set()
+    pending = [root_id]
+    while pending:
+        node_id = pending.pop()
+        if node_id in result:
+            continue
+        result.add(node_id)
+        pending.extend(children.get(node_id, ()))
+    return result
+
+
+def _operation_touches_subtree(
+    operation: EditOperation,
+    *,
+    base_descendants: set[str],
+    candidate_descendants: set[str],
+) -> bool:
+    """Whether an operation changes a node in this source-bound subtree."""
+
+    return any(
+        node_id in base_descendants or node_id in candidate_descendants
+        for node_id in (
+            operation.base_node_id,
+            operation.edited_node_id,
+            operation.old_parent_id,
+            operation.new_parent_id,
+        )
+        if node_id is not None
+    )
+
+
+def _tight_list_topology_owner(
+    *,
+    item: ListItem,
+    item_id: str,
+    base_by_stable: Mapping[str, SemanticNode],
+    candidate_by_stable: Mapping[str, SemanticNode],
+    base_children: Mapping[str | None, Iterable[str]],
+    candidate_children: Mapping[str | None, Iterable[str]],
+    operations: tuple[EditOperation, ...],
+) -> str | None:
+    """Return the real inline edit which owns one tight list item's leaf.
+
+    A tight ``<li>`` has no paragraph storage node. Adding Markdown inline
+    structure changes its topology leaf even though the corresponding
+    ``ListItem`` itself is unchanged, so the generic renderer assigns that leaf
+    to a synthetic operation.  This narrow bridge is sound only when the item
+    has one stable, payload-free inline paragraph and all work below it is a
+    uniquely mapped Markdown-inline edit.
+    """
+
+    base_item = base_by_stable.get(item_id)
+    candidate_item = candidate_by_stable.get(item_id)
+    if (
+        item.loose
+        or len(item.children) != 1
+        or not isinstance(item.children[0], Paragraph)
+        or base_item is None
+        or candidate_item is None
+        or base_item.node_type != "ListItem"
+        or candidate_item.node_type != "ListItem"
+        or not base_item.payload_free
+        or base_item.parent_id != candidate_item.parent_id
+        or base_item.ordinal != candidate_item.ordinal
+    ):
+        return None
+
+    sibling_ids = tuple(base_children.get(base_item.parent_id, ()))
+    if (
+        sum(
+            base_by_stable[sibling_id].subtree_fingerprint == base_item.subtree_fingerprint
+            for sibling_id in sibling_ids
+        )
+        != 1
+    ):
+        return None
+
+    base_item_children = tuple(base_children.get(item_id, ()))
+    candidate_item_children = tuple(candidate_children.get(item_id, ()))
+    if (
+        len(base_item_children) != 1
+        or base_item_children != candidate_item_children
+        or base_by_stable[base_item_children[0]].node_type != "Paragraph"
+        or candidate_by_stable[candidate_item_children[0]].node_type != "Paragraph"
+    ):
+        return None
+
+    paragraph_id = base_item_children[0]
+    operations_by_edited = {operation.edited_node_id: operation for operation in operations if operation.edited_node_id}
+    paragraph_operation = operations_by_edited.get(paragraph_id)
+    if paragraph_operation is None or paragraph_operation.kind != "update" or not paragraph_operation.topology_only:
+        return None
+
+    base_descendants = _subtree_node_ids(base_children, item_id)
+    candidate_descendants = _subtree_node_ids(candidate_children, item_id)
+    allowed_nodes = {"ListItem", "Paragraph", *_TIGHT_LIST_MARKDOWN_INLINE_NODE_TYPES}
+    if any(base_by_stable[node_id].node_type not in allowed_nodes for node_id in base_descendants) or any(
+        candidate_by_stable[node_id].node_type not in allowed_nodes for node_id in candidate_descendants
+    ):
+        return None
+
+    for operation in operations:
+        if not _operation_touches_subtree(
+            operation,
+            base_descendants=base_descendants,
+            candidate_descendants=candidate_descendants,
+        ):
+            continue
+        if operation.kind == "move" or item_id in {operation.base_node_id, operation.edited_node_id}:
+            return None
+        if operation.kind not in {"update", "insert", "delete"}:
+            return None
+
+    return operation_id(paragraph_operation)
+
+
 def _semantic_snapshot_with_objects(
     document: Document,
     *,
     base: bool,
+    markdown_authoritative_tables: bool = False,
 ) -> tuple[tuple[SemanticNode, ...], tuple[SourceMapEntry, ...], dict[int, str], dict[int, Node]]:
     nodes: list[SemanticNode] = []
     entries: list[SourceMapEntry] = []
@@ -1243,7 +1392,10 @@ def _semantic_snapshot_with_objects(
             local_fingerprint=_local_fingerprint(node, semantic_cache),
             topology_fingerprint=topology,
             leaves=leaves,
-            payload_free=_subtree_payload_free(node),
+            payload_free=(
+                _subtree_payload_free(node)
+                or (markdown_authoritative_tables and node_type in {"Table", "TableRow", "TableCell"})
+            ),
         )
         nodes.append(semantic_node)
         object_to_node[id(node)] = node_id
@@ -1306,6 +1458,7 @@ def macro_identities(document: Document) -> tuple[MacroIdentity, ...]:
             node_id=object_to_node[object_id],
             macro_id=node.macro_id,
             schema_version=node.macro_schema_version,
+            kind="code" if isinstance(node, CodeBlock) else node.name,
         )
         for object_id, node in object_values.items()
         if _macro_identity_witnessed(node)
@@ -1338,6 +1491,7 @@ def apply_macro_identities(
     identities: tuple[MacroIdentity, ...],
     base_nodes: tuple[SemanticNode, ...],
     accept_partial_correspondence: bool = False,
+    markdown_authoritative_tables: bool = False,
 ) -> Document:
     """Reapply unique remote macro identities after Markdown parsing.
 
@@ -1361,9 +1515,22 @@ def apply_macro_identities(
 
     if not identities:
         return document
-    edited_nodes, _entries, object_to_edited, object_values = _semantic_snapshot_with_objects(document, base=False)
+    edited_nodes, _entries, object_to_edited, object_values = _semantic_snapshot_with_objects(
+        document,
+        base=False,
+        markdown_authoritative_tables=markdown_authoritative_tables,
+    )
+    if markdown_authoritative_tables:
+        base_nodes = tuple(
+            replace(node, payload_free=True) if node.node_type in {"Table", "TableRow", "TableCell"} else node
+            for node in base_nodes
+        )
     try:
-        correspondence = match_edit_operations(base_nodes, edited_nodes)
+        correspondence = match_edit_operations(
+            base_nodes,
+            edited_nodes,
+            markdown_authoritative_tables=markdown_authoritative_tables,
+        )
     except SemanticMappingAmbiguous as error:
         if not accept_partial_correspondence or error.partial is None:
             raise
@@ -1542,6 +1709,7 @@ def candidate_maps(
     registry: Any | None = None,
     attachment_filename_map: tuple[tuple[str, str], ...] = (),
     presentation_occurrences: dict[int, str] | None = None,
+    markdown_authoritative_tables: bool = False,
     #: Take the confined proof a tie leaves behind instead of failing.
     #: Off by default: a caller that cannot reason about ambiguous scopes must
     #: keep getting the exception.
@@ -1557,8 +1725,17 @@ def candidate_maps(
     tuple[SourceMapEntry, ...],
     tuple[StorageLeafRef, ...],
 ]:
-    nodes, _entries, object_to_edited, object_values = _semantic_snapshot_with_objects(document, base=False)
+    nodes, _entries, object_to_edited, object_values = _semantic_snapshot_with_objects(
+        document,
+        base=False,
+        markdown_authoritative_tables=markdown_authoritative_tables,
+    )
     if base_nodes is not None and base_source_map_entries is not None:
+        if markdown_authoritative_tables:
+            base_nodes = tuple(
+                replace(node, payload_free=True) if node.node_type in {"Table", "TableRow", "TableCell"} else node
+                for node in base_nodes
+            )
         _storage_to_node, node_to_storage = build_base_source_maps(base_source_map_entries)
         base_nodes = tuple(replace(node, leaves=node_to_storage.get(node.node_id, ())) for node in base_nodes)
     if base_nodes is None:
@@ -1566,7 +1743,11 @@ def candidate_maps(
         delta: tuple[EditOperation, ...] = ()
     else:
         try:
-            result = match_edit_operations(base_nodes, nodes)
+            result = match_edit_operations(
+                base_nodes,
+                nodes,
+                markdown_authoritative_tables=markdown_authoritative_tables,
+            )
         except SemanticMappingAmbiguous as error:
             # Opt-in, and off by default so every existing caller keeps failing
             # closed. A caller that asks for it gets the correspondence the walk
@@ -1712,6 +1893,26 @@ def candidate_maps(
         object_id = edited_to_object[node.node_id]
         object_to_operation[object_id] = (owner_id, stable_id)
         object_to_stable[object_id] = stable_id
+
+    # A tight list's storage leaf belongs to the ``ListItem`` object, while
+    # Markdown inline edits live in its only Paragraph child.  Replace the
+    # renderer's synthetic ListItem owner with that real child operation only
+    # for the deliberately narrow, source-bound shape proved by this helper.
+    for object_id, list_item in object_values.items():
+        if not isinstance(list_item, ListItem):
+            continue
+        list_item_id = object_to_stable[object_id]
+        tight_owner_id = _tight_list_topology_owner(
+            item=list_item,
+            item_id=list_item_id,
+            base_by_stable=base_by_stable,
+            candidate_by_stable=stable_by_id,
+            base_children=base_children,
+            candidate_children=stable_children,
+            operations=delta,
+        )
+        if tight_owner_id is not None:
+            object_to_operation[object_id] = (tight_owner_id, list_item_id)
     xhtml, attachments, warnings, rendered = render_cfx_with_source_map(
         document,
         registry=registry,

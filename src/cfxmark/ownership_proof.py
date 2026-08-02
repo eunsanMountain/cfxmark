@@ -286,6 +286,7 @@ def attribution_witness_sha256(
     remote_subtrees: Sequence[RemoteSubtreeArtifact],
     presentation_authority: PresentationArtifact,
     options_sha256: str,
+    markdown_authoritative_tables: bool = False,
 ) -> str:
     """Fingerprint the independent source-map witness used to verify user owners."""
 
@@ -328,10 +329,11 @@ def attribution_witness_sha256(
 
     payload = json.dumps(
         [
-            "cfxmark-attribution-witness-v2",
+            "cfxmark-attribution-witness-v3",
             baseline_matches_source_storage,
             list(attachment_filename_map),
             asdict(presentation_authority),
+            markdown_authoritative_tables,
             options_sha256,
             [entry_document(entry) for entry in base_source_map_entries],
             [node_document(node) for node in base_semantic_nodes],
@@ -804,6 +806,7 @@ def prove_candidate_ownership(
     match_base_semantic_nodes: Sequence[SemanticNode] | None = None,
     match_base_source_map_entries: Sequence[SourceMapEntry] | None = None,
     presentation_authority: PresentationArtifact,
+    markdown_authoritative_tables: bool = False,
     options_sha256: str,
     registry: Any | None = None,
 ) -> OwnershipResult:
@@ -872,6 +875,7 @@ def prove_candidate_ownership(
                 attachment_filename_map=attachment_filename_map,
                 remote_subtrees=base_artifact.remote_subtrees,
                 presentation_authority=presentation_authority,
+                markdown_authoritative_tables=markdown_authoritative_tables,
                 options_sha256=options_sha256,
             ),
         ),

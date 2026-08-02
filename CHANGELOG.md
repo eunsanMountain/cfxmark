@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-08-02
+
+Three changes to what the managed publish will and will not prove. An ordinary edit that
+used to be refused now publishes, and nothing that was refused for a real reason became
+permitted.
+
+### Added
+
+- **An explicit full-replacement contract.** Until now a deliberate rewrite of a page had
+  no supported path: the ownership proof asks "which stored content does this replace",
+  and a section-for-section rewrite cannot answer it. The proof is unchanged and still
+  refuses. `build_replacement_manifest()` is a separate, opt-in route beside it, binding
+  the final candidate's storage hash and a value-safe disclosure of the macro identities
+  the replacement drops. Raw macro UUIDs affect only the hash; they never appear in the
+  returned manifest, which reports kind, semantic path, ordinal and count.
+
+### Fixed
+
+- **A tight list item lost its edits.** Adding a bold, emphasised, struck or linked span
+  inside a list item written without a `<p>` wrapper was refused as
+  `unclassified-storage-change`. The item's topology leaf had no source-map entry at all,
+  so nothing could own the change; the `<p>`-wrapped form worked because its paragraph
+  carried one. The leaf is now attributed to the operation that actually changed the
+  item's inline children, and only where the item corresponds uniquely, has not moved,
+  and holds no macro, task state or preserved payload.
+
+- **A page gained a table and lost its other tables' formatting.** Presentation was
+  matched between the remote and candidate table sets as if they were the same set, so
+  adding a table made every unchanged one ambiguous. Remote tables are now matched by
+  their own identity; a new table inherits nothing, and a remote table that was
+  rewritten, deleted or duplicated is still refused.
+
 ## [0.6.0] — 2026-08-01
 
 Correspondence a tie did not touch, a table parser that reads what it wrote, a

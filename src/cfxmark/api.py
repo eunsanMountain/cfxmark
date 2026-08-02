@@ -78,6 +78,7 @@ from cfxmark.presentation import (
     TableCellAddress,
     TableCellPresentation,
     TableTopologyAuthority,
+    _iter_tables,
     apply_presentation_with_authority,
     extract_presentation,
 )
@@ -211,6 +212,15 @@ def _asset_transport_identity_changed(
 
 
 def _ownership_diagnostic(code: str, *, source_fingerprint: str, ordinal: int) -> ConversionDiagnostic:
+    if code == "full-replacement-available":
+        return make_diagnostic(
+            code="full-replacement-available",
+            category="informational",
+            severity="informational",
+            message="the strict ownership proof refused this candidate; an explicitly approved full replacement is available",
+            source_fingerprint=source_fingerprint,
+            ordinal=ordinal,
+        )
     if code == "migration-user-overlap-ambiguous":
         return make_diagnostic(
             code="migration-user-overlap-ambiguous",
@@ -479,6 +489,133 @@ def _presentation_changed(
     if base_artifact is None:
         return False
     return presentation != base_artifact.presentation
+
+
+_ALIGNMENT_STYLE_RE = re.compile(r"\s*text-align\s*:\s*(left|center|right)\s*;?\s*\Z", re.IGNORECASE)
+
+
+def _markdown_authoritative_table_presentation(
+    base_artifact: MarkdownArtifact,
+    source_storage: str,
+) -> bool:
+    """Whether every remote table contains only Markdown-regenerable presentation.
+
+    This is deliberately a type check, not a value comparison with M1.  Once a
+    source table has no remote-only presentation, the Markdown author owns its
+    dimensions and alignment values; no cell-to-cell attribution is needed.
+    """
+
+    tables = _iter_tables(base_artifact.document)
+    if not tables or not any(
+        cell.source_style is not None
+        for table in tables
+        for row in (table.header, *table.body)
+        if row is not None
+        for cell in row.cells
+    ):
+        return False
+    source_root = _parse_fragment_to_element(source_storage)
+    source_tables = [
+        element for element in source_root.iter() if isinstance(element.tag, str) and strip_ns(element.tag) == "table"
+    ]
+    if len(source_tables) != len(tables):
+        return False
+    return all(
+        _table_presentation_is_markdown_regenerable(table, source_table)
+        for table, source_table in zip(tables, source_tables, strict=True)
+    )
+
+
+def _without_markdown_authoritative_table_protection(base_artifact: MarkdownArtifact) -> MarkdownArtifact:
+    """Drop only table-local recovery state once Markdown owns every table."""
+
+    table_paths = {
+        tuple(table.source_path) for table in _iter_tables(base_artifact.document) if table.source_path is not None
+    }
+    if not table_paths:
+        return base_artifact
+
+    def is_table_local(path: tuple[str, ...]) -> bool:
+        return any(path[: len(table_path)] == table_path for table_path in table_paths)
+
+    return replace(
+        base_artifact,
+        protected_regions=tuple(
+            region for region in base_artifact.protected_regions if not is_table_local(tuple(region.remote_node_path))
+        ),
+        remote_subtrees=tuple(
+            subtree for subtree in base_artifact.remote_subtrees if not is_table_local(tuple(subtree.remote_node_path))
+        ),
+    )
+
+
+def _table_presentation_is_markdown_regenerable(table: Table, source_table: ET._Element) -> bool:
+    if table.header is None or any(
+        descendant is not source_table and strip_ns(descendant.tag) == "table"
+        for descendant in source_table.iter()
+        if isinstance(descendant.tag, str)
+    ):
+        return False
+    if any(ns_of(descendant.tag) == AC_URI for descendant in source_table.iter() if isinstance(descendant.tag, str)):
+        return False
+    if any(
+        strip_ns(descendant.tag) in {"blockquote", "div", "hr", "li", "ol", "pre", "ul"}
+        for descendant in source_table.iter()
+        if isinstance(descendant.tag, str)
+    ):
+        return False
+    if set(source_table.attrib) - {"class"}:
+        return False
+    if source_table.get("class") not in {None, "confluenceTable"}:
+        return False
+
+    source_sections = [child for child in source_table if isinstance(child.tag, str)]
+    if [strip_ns(section.tag) for section in source_sections] != ["thead", "tbody"]:
+        return False
+    header_section, body_section = source_sections
+    source_rows = [("header", row) for row in header_section if isinstance(row.tag, str)] + [
+        ("body", row) for row in body_section if isinstance(row.tag, str)
+    ]
+    rows = (table.header,) + table.body
+    if len(source_rows) != len(rows) or any(
+        kind != ("header" if index == 0 else "body") for index, (kind, _row) in enumerate(source_rows)
+    ):
+        return False
+
+    for row_index, ((kind, source_row), row) in enumerate(zip(source_rows, rows, strict=True)):
+        if strip_ns(source_row.tag) != "tr" or source_row.attrib:
+            return False
+        source_cells = [cell for cell in source_row if isinstance(cell.tag, str)]
+        expected_tag = "th" if kind == "header" else "td"
+        if len(source_cells) != len(row.cells) or len(row.cells) != len(table.alignments):
+            return False
+        for column_index, (source_cell, cell) in enumerate(zip(source_cells, row.cells, strict=True)):
+            if (
+                strip_ns(source_cell.tag) != expected_tag
+                or cell.colspan != 1
+                or cell.rowspan != 1
+                or cell.background is not None
+            ):
+                return False
+            allowed_attributes = {"class", "style", "align"}
+            if set(source_cell.attrib) - allowed_attributes:
+                return False
+            expected_class = "confluenceTh" if row_index == 0 else "confluenceTd"
+            if source_cell.get("class") not in {None, expected_class}:
+                return False
+            if (align := source_cell.get("align")) is not None and align.strip().lower() not in {
+                "left",
+                "center",
+                "right",
+            }:
+                return False
+            if cell.align != table.alignments[column_index]:
+                return False
+            if cell.source_style is not None:
+                match = _ALIGNMENT_STYLE_RE.fullmatch(cell.source_style)
+                if match is None or match.group(1).lower() != cell.align.value:
+                    return False
+    return True
 
 
 def _rebase_transient_semantic_nodes(
@@ -1537,6 +1674,7 @@ def to_md_artifact(
         splice_source=xhtml,
         options=opts,
         macros=registry,
+        _skip_markdown_authoritative_tables=True,
     )
     preserved_subtree_ids = set(candidate.preserved_subtrees)
     preserved_subtree_paths = tuple(
@@ -1746,6 +1884,7 @@ def _to_cfx_artifact_core(
     options: ConversionOptions | None = None,
     macros: MacroRegistry | None = None,
     operation_base: tuple[tuple[SemanticNode, ...], tuple[SourceMapEntry, ...]] | None = None,
+    markdown_authoritative_tables: bool = False,
 ) -> CfxArtifact:
     """Build one candidate without recursively invoking the ownership proof.
 
@@ -1854,8 +1993,10 @@ def _to_cfx_artifact_core(
                     registry=registry,
                     passthrough_html_comment_prefixes=opts.passthrough_html_comment_prefixes,
                 )
-                base_render_presentation = _presentation_without_protected_tables(
-                    presentation or PresentationArtifact(), base_artifact
+                base_render_presentation = (
+                    PresentationArtifact()
+                    if markdown_authoritative_tables
+                    else _presentation_without_protected_tables(presentation or PresentationArtifact(), base_artifact)
                 )
                 (
                     base_transient_document,
@@ -1867,6 +2008,7 @@ def _to_cfx_artifact_core(
                     registry=registry,
                     attachment_filename_map=opts.attachment_filename_map,
                     presentation_occurrences=base_presentation_occurrences,
+                    markdown_authoritative_tables=markdown_authoritative_tables,
                 )[0]
                 if transient_base_nodes:
                     protected_block_region_paths = {
@@ -1938,7 +2080,11 @@ def _to_cfx_artifact_core(
             )
         )
     effective_presentation = presentation_artifact
-    render_presentation = _presentation_without_protected_tables(effective_presentation, base_artifact)
+    render_presentation = (
+        PresentationArtifact()
+        if markdown_authoritative_tables
+        else _presentation_without_protected_tables(effective_presentation, base_artifact)
+    )
     document, presentation_messages, presentation_occurrences = apply_presentation_with_authority(
         document,
         render_presentation,
@@ -1991,6 +2137,7 @@ def _to_cfx_artifact_core(
                 document,
                 identities=base_artifact.macro_identities,
                 base_nodes=identity_base_nodes,
+                markdown_authoritative_tables=markdown_authoritative_tables,
             )
             identities_applied = True
         (
@@ -2010,6 +2157,7 @@ def _to_cfx_artifact_core(
             registry=registry,
             attachment_filename_map=opts.attachment_filename_map,
             presentation_occurrences=presentation_occurrences,
+            markdown_authoritative_tables=markdown_authoritative_tables,
         )
     except SemanticMappingAmbiguous as error:
         diagnostics.append(
@@ -2050,6 +2198,7 @@ def _to_cfx_artifact_core(
                     identities=base_artifact.macro_identities,
                     base_nodes=identity_base_nodes,
                     accept_partial_correspondence=True,
+                    markdown_authoritative_tables=markdown_authoritative_tables,
                 )
         (
             semantic_nodes,
@@ -2068,6 +2217,7 @@ def _to_cfx_artifact_core(
             registry=registry,
             attachment_filename_map=opts.attachment_filename_map,
             presentation_occurrences=presentation_occurrences,
+            markdown_authoritative_tables=markdown_authoritative_tables,
             accept_partial_correspondence=True,
         )
     if base_artifact is not None and _asset_transport_identity_changed(
@@ -2252,6 +2402,7 @@ def to_cfx_artifact(
     splice_source: str | None = None,
     options: ConversionOptions | None = None,
     macros: MacroRegistry | None = None,
+    _skip_markdown_authoritative_tables: bool = False,
 ) -> CfxArtifact:
     """Convert managed Markdown and attach a source-bound ownership proof.
 
@@ -2262,50 +2413,64 @@ def to_cfx_artifact(
 
     opts = options or DEFAULT_OPTIONS
     registry = macros or default_registry
+    markdown_authoritative_tables = (
+        not _skip_markdown_authoritative_tables
+        and base_artifact is not None
+        and splice_source is not None
+        and _markdown_authoritative_table_presentation(base_artifact, splice_source)
+    )
+    effective_base = (
+        _without_markdown_authoritative_table_protection(base_artifact)
+        if markdown_authoritative_tables and base_artifact is not None
+        else base_artifact
+    )
     candidate = _to_cfx_artifact_core(
         markdown,
         presentation=presentation,
-        base_artifact=base_artifact,
+        base_artifact=effective_base,
         splice_source=splice_source,
         options=opts,
         macros=registry,
+        markdown_authoritative_tables=markdown_authoritative_tables,
     )
-    if base_artifact is None or splice_source is None:
+    if effective_base is None or splice_source is None:
         return candidate
 
     baseline = _to_cfx_artifact_core(
-        base_artifact.markdown,
-        presentation=base_artifact.presentation,
-        base_artifact=base_artifact,
+        effective_base.markdown,
+        presentation=effective_base.presentation,
+        base_artifact=effective_base,
         splice_source=splice_source,
         options=opts,
         macros=registry,
+        markdown_authoritative_tables=markdown_authoritative_tables,
     )
     # Derive the user edit operations against the C0 baseline so their tombstones
     # cover leaves the S0->C0 round-trip introduced (empty-paragraph <br>, code
     # normalization). The remote-subtree splice and protected regions are keyed to
     # S0 node ids, so documents carrying them keep the proven S0 operation base;
     # the managed full-migration path strips both, so it takes the C0 base.
-    use_c0_ops = not (base_artifact.remote_subtrees or base_artifact.protected_regions)
+    use_c0_ops = not (effective_base.remote_subtrees or effective_base.protected_regions)
     presentation_changed = _presentation_changed(
-        presentation if presentation is not None else base_artifact.presentation,
-        base_artifact,
+        presentation if presentation is not None else effective_base.presentation,
+        effective_base,
     )
     operation_candidate = candidate
     if presentation_changed or use_c0_ops:
         operation_candidate = _to_cfx_artifact_core(
             markdown,
-            presentation=base_artifact.presentation if presentation_changed else presentation,
-            base_artifact=base_artifact,
+            presentation=effective_base.presentation if presentation_changed else presentation,
+            base_artifact=effective_base,
             splice_source=splice_source,
             options=opts,
             macros=registry,
             operation_base=(baseline.semantic_nodes, baseline.source_map_entries) if use_c0_ops else None,
+            markdown_authoritative_tables=markdown_authoritative_tables,
         )
     proof_candidate = _with_operation_layer(candidate, operation_candidate, c0_bound=use_c0_ops)
     supplemental_diagnostics = collateral_diagnostics(splice_source, baseline.xhtml)
     ownership_base_stream = _diagnostics_fail_closed_on_identity_collision(
-        (*base_artifact.diagnostics, *supplemental_diagnostics),
+        (*effective_base.diagnostics, *supplemental_diagnostics),
         source_fingerprint=preservation_signature(splice_source),
     )
     ownership_diagnostics_by_source = {
@@ -2320,16 +2485,16 @@ def to_cfx_artifact(
         ownership_unmapped_storage,
     ) = _bind_exact_migration_occurrences(
         list(ownership_base_diagnostics),
-        dict(base_artifact.base_storage_to_node),
-        dict(base_artifact.base_node_to_storage),
-        tuple(base_artifact.source_map_entries),
-        tuple(base_artifact.unmapped_storage_leaves),
+        dict(effective_base.base_storage_to_node),
+        dict(effective_base.base_node_to_storage),
+        tuple(effective_base.source_map_entries),
+        tuple(effective_base.unmapped_storage_leaves),
     )
     ownership_semantic_nodes = tuple(
-        replace(node, leaves=ownership_node_to_storage.get(node.node_id, ())) for node in base_artifact.semantic_nodes
+        replace(node, leaves=ownership_node_to_storage.get(node.node_id, ())) for node in effective_base.semantic_nodes
     )
     ownership_base = replace(
-        base_artifact,
+        effective_base,
         diagnostics=tuple(ownership_base_diagnostics_list),
         base_storage_to_node=ownership_storage_to_node,
         base_node_to_storage=ownership_node_to_storage,
@@ -2353,9 +2518,13 @@ def to_cfx_artifact(
         )
         is not None
     }
-    ownership_presentation_authority = _presentation_without_protected_tables(
-        presentation if presentation is not None else base_artifact.presentation,
-        base_artifact,
+    ownership_presentation_authority = (
+        PresentationArtifact()
+        if markdown_authoritative_tables
+        else _presentation_without_protected_tables(
+            presentation if presentation is not None else effective_base.presentation,
+            effective_base,
+        )
     )
     ownership_options_sha256 = _conversion_options_sha256(opts)
     composed_migration = _compose_atomic_migrations(splice_source, ownership_base.diagnostics)
@@ -2373,6 +2542,7 @@ def to_cfx_artifact(
         match_base_semantic_nodes=operation_candidate.semantic_match_base_nodes,
         match_base_source_map_entries=op_base_entries,
         presentation_authority=ownership_presentation_authority,
+        markdown_authoritative_tables=markdown_authoritative_tables,
         options_sha256=ownership_options_sha256,
         registry=registry,
     )
@@ -2392,6 +2562,14 @@ def to_cfx_artifact(
         )
         diagnostics.append(ownership_diagnostic)
         ownership_diagnostics.append(ownership_diagnostic)
+    if proof_codes:
+        diagnostics.append(
+            _ownership_diagnostic(
+                "full-replacement-available",
+                source_fingerprint=proof.artifacts.source_storage_sha256,
+                ordinal=len(proof_codes),
+            )
+        )
     ordered = _diagnostics_fail_closed_on_identity_collision(
         diagnostics,
         source_fingerprint=proof.artifacts.source_storage_sha256,
@@ -2405,7 +2583,7 @@ def to_cfx_artifact(
     source_migration_report = MigrationReport.build(
         occurrences=occurrences_from_diagnostics(
             report_diagnostics,
-            source_storage_sha256=base_artifact.source_storage_sha256,
+            source_storage_sha256=effective_base.source_storage_sha256,
         )
     )
     source_bound_candidate = replace(
@@ -2413,7 +2591,7 @@ def to_cfx_artifact(
         diagnostics=ordered,
         push_safe=candidate.push_safe and not proof.fatal,
         ownership_proof_required=True,
-        source_storage_sha256=base_artifact.source_storage_sha256,
+        source_storage_sha256=effective_base.source_storage_sha256,
         source_migration_report=source_migration_report,
         ownership_proof=proof,
         ownership_proof_sha256=proof.sha256(),
@@ -2424,8 +2602,9 @@ def to_cfx_artifact(
         ownership_baseline_semantic_nodes=baseline.semantic_nodes,
         ownership_baseline_matches_source_storage=baseline.xhtml == splice_source,
         ownership_attachment_filename_map=opts.attachment_filename_map,
-        ownership_remote_subtrees=base_artifact.remote_subtrees,
+        ownership_remote_subtrees=effective_base.remote_subtrees,
         ownership_presentation_authority=ownership_presentation_authority,
+        ownership_markdown_authoritative_tables=markdown_authoritative_tables,
         ownership_options=opts,
         ownership_options_sha256=ownership_options_sha256,
     )

@@ -72,6 +72,10 @@ _PRODUCER_EFFECTS: dict[str, MigrationEffect] = {
     # Omitted from the Markdown body, but reattached from fresh source-bound
     # presentation authority when a managed candidate is built.
     "table-cell-background-omitted": "preserved",
+    # The ordinary ownership proof is still blocking.  This informational
+    # diagnostic only tells an outer publisher that it may offer the separate,
+    # explicit full-replacement contract; it never makes the normal path pass.
+    "full-replacement-available": "preserved",
     "table-cell-background-unrenderable": "removed",
     "table-cell-background-untracked": "removed",
     "table-column-alignment-mixed": "removed",

@@ -219,6 +219,92 @@ def test_table_alignment_leaf_fingerprint_uses_case_insensitive_typed_value(sour
     assert ">Q</p>" in candidate.xhtml
 
 
+def test_markdown_authoritative_tables_allow_column_and_alignment_rewrites_without_losing_macro_identity() -> None:
+    storage = (
+        "<p>Before</p>"
+        '<ac:structured-macro ac:name="jira" ac:schema-version="1" ac:macro-id="macro-1">'
+        '<ac:parameter ac:name="jqlQuery">key = DEMO-1</ac:parameter>'
+        "</ac:structured-macro>"
+        '<table class="confluenceTable"><thead><tr>'
+        '<th class="confluenceTh" style="text-align:right">First</th>'
+        '<th class="confluenceTh" style="text-align:right">Second</th>'
+        "</tr></thead><tbody><tr>"
+        '<td class="confluenceTd" style="text-align:right">A</td>'
+        '<td class="confluenceTd" style="text-align:right">B</td>'
+        "</tr></tbody></table>"
+        '<table class="confluenceTable"><thead><tr>'
+        '<th class="confluenceTh" style="text-align:right">Third</th>'
+        '<th class="confluenceTh" style="text-align:right">Fourth</th>'
+        "</tr></thead><tbody><tr>"
+        '<td class="confluenceTd" style="text-align:right">C</td>'
+        '<td class="confluenceTd" style="text-align:right">D</td>'
+        "</tr></tbody></table>"
+    )
+    options = cfxmark.ConversionOptions(profile="editable")
+    base = cfxmark.to_md_artifact(storage, options=options)
+    edited = (
+        base.markdown.replace("| First | Second |", "| First | Second | Speed |")
+        .replace("| ---: | ---: |", "| :--- | :---: | ---: |")
+        .replace("| A | B |", "| A | B | 1 |")
+        .replace("| Third | Fourth |", "| Third | Fourth | Speed |")
+        .replace("| C | D |", "| C | D | 2 |")
+    )
+
+    candidate = cfxmark.to_cfx_artifact(
+        edited,
+        presentation=base.presentation,
+        base_artifact=base,
+        splice_source=storage,
+        options=options,
+    )
+
+    assert candidate.ownership_markdown_authoritative_tables is True
+    assert candidate.push_safe is True
+    assert 'ac:macro-id="macro-1"' in candidate.xhtml
+    assert candidate.xhtml.count("<table") == 2
+    assert 'style="text-align: left;"' in candidate.xhtml
+    assert 'style="text-align: center;"' in candidate.xhtml
+    assert 'style="text-align: right;"' in candidate.xhtml
+    cfxmark.validate_managed_cfx_artifact(candidate, source_storage=storage, options=options)
+
+
+@pytest.mark.parametrize(
+    "storage",
+    [
+        (
+            '<table><colgroup><col style="width:50%"/></colgroup><thead><tr>'
+            '<th style="text-align:right">H</th></tr></thead><tbody><tr>'
+            '<td style="text-align:right">X</td></tr></tbody></table>'
+        ),
+        (
+            '<table><thead><tr><th style="text-align:right">H</th></tr></thead><tbody><tr>'
+            '<td style="text-align:right;background-color:#ff0000">X</td>'
+            "</tr></tbody></table>"
+        ),
+    ],
+    ids=["column-width", "cell-background"],
+)
+def test_non_markdown_table_presentation_keeps_the_existing_fail_closed_proof(storage: str) -> None:
+    options = cfxmark.ConversionOptions(profile="editable")
+    base = cfxmark.to_md_artifact(storage, options=options)
+    edited = (
+        base.markdown.replace("| H |", "| H | New |")
+        .replace("| ---: |", "| ---: | ---: |")
+        .replace("| X |", "| X | 1 |")
+    )
+
+    candidate = cfxmark.to_cfx_artifact(
+        edited,
+        presentation=base.presentation,
+        base_artifact=base,
+        splice_source=storage,
+        options=options,
+    )
+
+    assert candidate.ownership_markdown_authoritative_tables is False
+    assert candidate.push_safe is False
+
+
 @pytest.mark.parametrize("source_align", ["LEFT !important", "left!important", "left /*x*/"])
 def test_table_alignment_with_unsupported_css_suffix_is_remote_preserved(source_align: str) -> None:
     storage = (

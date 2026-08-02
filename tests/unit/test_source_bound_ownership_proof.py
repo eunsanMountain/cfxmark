@@ -637,6 +637,112 @@ def test_two_insert_operations_use_a_real_parent_topology_operation() -> None:
     assert topology_changes[0].owner == operation_id(topology_updates[0])
 
 
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        " **strong**",
+        " *emphasis*",
+        " ~~strike~~",
+        " `code`",
+        " [link](https://example.test)",
+    ],
+)
+def test_tight_list_inline_edit_owns_the_li_topology_with_its_paragraph_operation(suffix: str) -> None:
+    storage = "<ul><li>Item</li></ul>"
+    base = _full_migration_base(storage)
+    candidate = cfxmark.to_cfx_artifact(
+        base.markdown.rstrip() + suffix + "\n",
+        presentation=base.presentation,
+        base_artifact=base,
+        splice_source=storage,
+        options=EDITABLE,
+    )
+    proof = _proof(candidate)
+    identity = (("ul[0]", "li[0]"), "topology", None, 0)
+    actual_operation_ids = {operation_id(item) for item in candidate.edit_operations}
+    owner_ids = {
+        entry.operation_id
+        for entry in candidate.source_map_entries
+        if any(
+            (leaf.semantic_path, leaf.field, leaf.attribute_name, leaf.occurrence_ordinal) == identity
+            for leaf in entry.leaves
+        )
+        and entry.operation_id in actual_operation_ids
+    }
+
+    assert candidate.push_safe is True
+    assert proof.unclassified == ()
+    assert len(owner_ids) == 1
+    owner = next(iter(owner_ids))
+    topology_operation = next(item for item in candidate.edit_operations if operation_id(item) == owner)
+    base_nodes = {item.node_id: item for item in candidate.semantic_match_base_nodes}
+    assert topology_operation.kind == "update"
+    assert topology_operation.topology_only is True
+    assert topology_operation.base_node_id is not None
+    assert base_nodes[topology_operation.base_node_id].node_type == "Paragraph"
+    assert {change.owner for change in proof.intended if change.identity == identity} == {owner}
+
+
+def test_text_edit_and_loose_list_inline_edit_remain_publishable() -> None:
+    tight_text = _candidate("<ul><li>Item</li></ul>", "- Item changed\n")
+    loose_storage = "<ul><li><p>Item</p></li></ul>"
+    loose_base = _full_migration_base(loose_storage)
+    loose_strong = cfxmark.to_cfx_artifact(
+        loose_base.markdown.rstrip() + " **strong**\n",
+        presentation=loose_base.presentation,
+        base_artifact=loose_base,
+        splice_source=loose_storage,
+        options=EDITABLE,
+    )
+
+    assert tight_text.push_safe is True
+    assert loose_strong.push_safe is True
+
+
+def test_tight_list_inline_attribution_refuses_duplicate_or_moved_item() -> None:
+    duplicate = _candidate("<ul><li>Same</li><li>Same</li></ul>", "- Same **strong**\n- Same\n")
+    moved = _candidate("<ul><li>A</li><li>B</li></ul>", "- B\n- A **strong**\n")
+
+    assert duplicate.push_safe is False
+    assert any(item.code == "unclassified-storage-change" for item in duplicate.diagnostics)
+    assert moved.push_safe is False
+    assert any(item.code == "semantic-mapping-ambiguous" for item in moved.diagnostics)
+
+
+def test_tight_list_inline_attribution_refuses_macro_and_task_payload() -> None:
+    macro_storage = (
+        '<ul><li>Item <ac:structured-macro ac:name="status">'
+        '<ac:parameter ac:name="title">Status</ac:parameter>'
+        "</ac:structured-macro></li></ul>"
+    )
+    macro_base = cfxmark.to_md_artifact(macro_storage, options=EDITABLE)
+    macro = cfxmark.to_cfx_artifact(
+        "<!-- cfxmark:list tight -->\n- Item **strong**\n",
+        presentation=macro_base.presentation,
+        base_artifact=macro_base,
+        splice_source=macro_storage,
+        options=EDITABLE,
+    )
+    task_storage = (
+        "<ac:task-list><ac:task><ac:task-id>41</ac:task-id>"
+        "<ac:task-status>incomplete</ac:task-status>"
+        "<ac:task-body>Keep this exact</ac:task-body></ac:task></ac:task-list>"
+    )
+    task_base = cfxmark.to_md_artifact(task_storage, options=EDITABLE)
+    task = cfxmark.to_cfx_artifact(
+        task_base.markdown.replace("Keep this exact", "Keep **strong**"),
+        presentation=task_base.presentation,
+        base_artifact=task_base,
+        splice_source=task_storage,
+        options=EDITABLE,
+    )
+
+    assert macro.push_safe is False
+    assert any(item.code == "protected-region-edited" for item in macro.diagnostics)
+    assert task.push_safe is False
+    assert any(item.code == "protected-region-edited" for item in task.diagnostics)
+
+
 def test_move_plus_edit_is_not_silently_split_into_independent_owners() -> None:
     candidate = _candidate("<p>A</p><p>B</p>", "B changed\n\nA\n")
     proof = _proof(candidate)

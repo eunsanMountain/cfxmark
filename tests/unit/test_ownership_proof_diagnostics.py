@@ -16,10 +16,10 @@ from cfxmark.ownership_proof import StorageLeafDiff, storage_leaf_diff
 
 EDITABLE = cfxmark.ConversionOptions(profile="editable")
 
-# Reproducible fatal proof (preflight W4 evidence): a single inline-code edit
-# inside one list item decomposes the ``li`` topology leaf into an owner nobody
-# can attribute, so the proof is fatal with exactly one unclassified leaf.
-_FATAL_SOURCE = "<ul><li>run the plain command now</li></ul>"
+# Reproducible fatal proof: duplicate list items make the intended source item
+# ambiguous. The tight-list attribution must not guess which identical ``li``
+# owns the inline-code edit, so the proof is fatal with one unclassified leaf.
+_FATAL_SOURCE = "<ul><li>run the plain command now</li><li>run the plain command now</li></ul>"
 
 
 def _fatal_managed_candidate() -> tuple[cfxmark.CfxArtifact, str]:
@@ -28,7 +28,7 @@ def _fatal_managed_candidate() -> tuple[cfxmark.CfxArtifact, str]:
         protected_regions=(),
         remote_subtrees=(),
     )
-    edited = base.markdown.replace("plain command", "`plain` command")
+    edited = base.markdown.replace("plain command", "`plain` command", 1)
     candidate = cfxmark.to_cfx_artifact(
         edited,
         base_artifact=base,
@@ -90,12 +90,11 @@ def test_ownership_proof_summary_carries_no_values() -> None:
         assert isinstance(ordinal, int)
 
 
-# A page with more fatal leaves than the display budget. Fourteen list items, one
-# inline-code edit each: every item's topology leaf loses its owner the same way the
-# single-item fixture above does, so the proof is fatal with fourteen unclassified
-# leaves and the cap has something to hide.
+# A page with more fatal leaves than the display budget. Fourteen identical list
+# items each receive an inline-code edit, so each topology leaf remains ambiguous
+# and the proof is fatal with fourteen unclassified leaves.
 def _many_leaf_fatal_candidate() -> tuple[cfxmark.CfxArtifact, str]:
-    source = "<ul>" + "".join(f"<li>run the plain command number {n} now</li>" for n in range(14)) + "</ul>"
+    source = "<ul>" + "".join("<li>run the plain command now</li>" for _ in range(14)) + "</ul>"
     base = dataclasses.replace(
         cfxmark.to_md_artifact(source, options=EDITABLE),
         protected_regions=(),

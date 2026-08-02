@@ -386,7 +386,12 @@ def build_candidate_source_maps(
     return operation_to_storage, storage_to_operation
 
 
-def match_edit_operations(base_nodes: Sequence[SemanticNode], edited_nodes: Sequence[SemanticNode]) -> EditMatchResult:
+def match_edit_operations(
+    base_nodes: Sequence[SemanticNode],
+    edited_nodes: Sequence[SemanticNode],
+    *,
+    markdown_authoritative_tables: bool = False,
+) -> EditMatchResult:
     """Prove a unique base-to-edited mapping using the normative precedence.
 
     Exact parent-scoped identity is resolved first, followed by unique
@@ -452,6 +457,7 @@ def match_edit_operations(base_nodes: Sequence[SemanticNode], edited_nodes: Sequ
                         residual_base,
                         residual_edited,
                         pair,
+                        markdown_authoritative_tables=markdown_authoritative_tables,
                     )
                 except SemanticMappingAmbiguous as tie:
                     # Confined, not resolved. The walk carries on so the rest of
@@ -711,6 +717,9 @@ def _tie_is_ownership_neutral(
     edited: _Tree,
     base_ids: Sequence[str],
     edited_ids: Sequence[str],
+    *,
+    markdown_authoritative_tables: bool = False,
+    parent_pair: tuple[str | None, str | None] = (None, None),
 ) -> bool:
     """Whether a tied minimum alignment can be resolved without guessing.
 
@@ -754,14 +763,34 @@ def _tie_is_ownership_neutral(
         return False
     if not all(edited.nodes[edited_id].payload_free for edited_id in tie_edited_ids):
         return False
+    exact_table_scope = markdown_authoritative_tables and _table_tie_scope(base, edited, parent_pair)
     for base_id in tie_base_ids:
         base_node = base.nodes[base_id]
         base_key = _semantic_equality_key(base_node)
         for edited_id in tie_edited_ids:
             edited_node = edited.nodes[edited_id]
             if edited_node.node_type == base_node.node_type and _semantic_equality_key(edited_node) == base_key:
-                return False
+                if not exact_table_scope:
+                    return False
     return True
+
+
+def _table_tie_scope(
+    base: _Tree,
+    edited: _Tree,
+    parent_pair: tuple[str | None, str | None],
+) -> bool:
+    """Whether a tied sibling run is inside a Markdown-authoritative table."""
+
+    base_parent, edited_parent = parent_pair
+    if base_parent is None or edited_parent is None:
+        return False
+    return (
+        base.nodes[base_parent].node_type in {"Table", "TableRow"}
+        and edited.nodes[edited_parent].node_type in {"Table", "TableRow"}
+        and base.nodes[base_parent].payload_free
+        and edited.nodes[edited_parent].payload_free
+    )
 
 
 def _forced_pairs_across_optimal_alignments(
@@ -849,6 +878,8 @@ def _unique_minimum_alignment(
     base_ids: Sequence[str],
     edited_ids: Sequence[str],
     parent_pair: tuple[str | None, str | None],
+    *,
+    markdown_authoritative_tables: bool = False,
 ) -> tuple[tuple[tuple[str, str], ...], tuple[str, ...], tuple[str, ...]]:
     if not any(
         base.nodes[base_id].node_type == edited.nodes[edited_id].node_type
@@ -898,7 +929,14 @@ def _unique_minimum_alignment(
             counts[base_index][edited_index] = min(2, sum(count for cost, count in choices if cost == minimum))
 
     if counts[-1][-1] != 1:
-        if _tie_is_ownership_neutral(base, edited, base_ids, edited_ids):
+        if _tie_is_ownership_neutral(
+            base,
+            edited,
+            base_ids,
+            edited_ids,
+            markdown_authoritative_tables=markdown_authoritative_tables,
+            parent_pair=parent_pair,
+        ):
             # A payload-free run substitution with no exact survivor: every
             # minimum script yields byte-identical storage and no identity is
             # carried, so the tie is only about the order of unrelated

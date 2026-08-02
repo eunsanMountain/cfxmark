@@ -83,6 +83,12 @@ from cfxmark.presentation import (
     TableTopologyAuthority,
     presentation_cell_occurrence_id,
 )
+from cfxmark.replacement import (
+    REPLACEMENT_MANIFEST_SCHEMA,
+    DiscardedIdentity,
+    ReplacementManifest,
+    build_replacement_manifest,
+)
 from cfxmark.source_map import EditOperation, SourceMapEntry, StorageLeafRef
 
 __all__ = [
@@ -136,6 +142,10 @@ __all__ = [
     "ColorCapability",
     "ColorCapabilityMatrix",
     "presentation_cell_occurrence_id",
+    "REPLACEMENT_MANIFEST_SCHEMA",
+    "DiscardedIdentity",
+    "ReplacementManifest",
+    "build_replacement_manifest",
     "StorageLeafRef",
     "SourceMapEntry",
     "EditOperation",
