@@ -359,8 +359,28 @@ def test_unknown_macro_becomes_opaque() -> None:
         ('<div class="content-wrapper"><p>inside</p></div>after', "inside<br>after"),
         ("<div>a<strong>b</strong>c</div>", "a**b**c"),
         ("<div><div>x</div>y</div>z", "x<br>y<br>z"),
+        ("before<div><strong>inside</strong></div>after", "before<br>**inside**<br>after"),
+        ("<div>x</div><strong>y</strong>", "x<br>**y**"),
+        ("<div>a<br/></div>c", "a<br>c"),
+        ("<div></div><div>x</div>", "x"),
+        ("<div>\n  lead\n  <p>para</p>\n</div>\n", "lead<br>para"),
+        ("<div>x</div> after", "x<br>after"),
     ],
 )
-def test_cell_div_keeps_surrounding_text(cell: str, expected: str) -> None:
-    out = md(f"<table><tbody><tr><th>h</th></tr><tr><td>{cell}</td></tr></tbody></table>")
+@pytest.mark.parametrize("cell_tag", ["td", "th"])
+def test_cell_div_is_a_line_boundary(cell_tag: str, cell: str, expected: str) -> None:
+    out = md(f"<table><tbody><tr><th>h</th></tr><tr><{cell_tag}>{cell}</{cell_tag}></tr></tbody></table>")
     assert out.splitlines()[-1] == f"| {expected} |"
+
+
+@pytest.mark.parametrize(
+    ("cell", "expected"),
+    [
+        ("<div>a<!-- c -->b</div>c", "ab<br>c"),
+        ("a<!-- c -->b<div>x</div>", "ab<br>x"),
+    ],
+)
+def test_cell_div_keeps_text_after_comment_and_reports_it(cell: str, expected: str) -> None:
+    result = cfxmark.to_md(f"<table><tbody><tr><th>h</th></tr><tr><td>{cell}</td></tr></tbody></table>")
+    assert result.markdown.rstrip("\n").splitlines()[-1] == f"| {expected} |"
+    assert result.losses

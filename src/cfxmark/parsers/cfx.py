@@ -1117,9 +1117,9 @@ def _parse_cell_content(
       place.
     """
 
-    direct_children = [child for child in cell_el if isinstance(child.tag, str)]
-    flat_children = list(_flatten_cell_children(cell_el))
-    has_p = any(not isinstance(c, str) and isinstance(c.tag, str) and strip_ns(c.tag) == "p" for c in flat_children)
+    direct_children = list(cell_el)
+    flat_children = _flatten_cell_children(cell_el)
+    has_p = any(isinstance(c, ET._Element) and _is_cell_paragraph(c) for c in flat_children)
     if not has_p and flat_children == direct_children:
         return _parse_inline(cell_el, ctx)
 
@@ -1127,58 +1127,97 @@ def _parse_cell_content(
     if cell_el.text and cell_el.text.strip():
         out.append(Text(content=cell_el.text))
 
+    # A div boundary breaks the line only once content follows it, so
+    # adjacent and empty divs never stack up extra breaks.
+    at_boundary = False
+
+    def end_line() -> None:
+        if isinstance(out[-1], Text):
+            out[-1] = Text(content=out[-1].content.rstrip())
+        out.append(HardBreak())
+
+    def break_line() -> None:
+        nonlocal at_boundary
+        if at_boundary and out and not isinstance(out[-1], HardBreak):
+            end_line()
+        at_boundary = False
+
     for child in flat_children:
+        if child is _CELL_BLOCK_BOUNDARY:
+            at_boundary = True
+            continue
         if isinstance(child, str):
-            # Loose text from an unwrapped div starts a new line, like
-            # a paragraph would.
-            if out:
-                out.append(HardBreak())
+            break_line()
             out.append(Text(content=child))
             continue
+        assert isinstance(child, ET._Element)
         if not isinstance(child.tag, str):
+            ctx.add_loss("XML comments and processing instructions are not represented in Markdown", child)
+            if child.tail and child.tail.strip():
+                break_line()
+                out.append(Text(content=child.tail))
             continue
-        if strip_ns(child.tag) == "p":
+        if _is_cell_paragraph(child):
             inline = _parse_inline(child, ctx)
-            if out and inline:
-                out.append(HardBreak())
+            if inline:
+                at_boundary = False
+                if out:
+                    end_line()
             align = _parse_alignment(child)
             if align and inline:
                 out.append(AlignedSpan(align=align, children=inline))
             else:
                 out.extend(inline)
             if child.tail and child.tail.strip():
+                at_boundary = False
                 out.append(HardBreak())
                 out.append(Text(content=child.tail))
         else:
+            break_line()
             out.extend(_parse_single_inline_child(child, ctx))
             if child.tail and child.tail.strip():
                 out.append(Text(content=child.tail))
     return tuple(out)
 
 
+#: Marks where an unwrapped cell ``<div>`` opened or closed. A div is a
+#: block, so content on either side of the boundary starts a new line.
+_CELL_BLOCK_BOUNDARY = object()
+
+
+def _is_cell_paragraph(child: ET._Element) -> bool:
+    return isinstance(child.tag, str) and strip_ns(child.tag) == "p"
+
+
 def _flatten_cell_children(
     parent: ET._Element,
-) -> list[ET._Element | str]:
-    """Yield ``parent``'s children, unwrapping known structural divs.
+) -> list[ET._Element | str | object]:
+    """Return ``parent``'s children, unwrapping known structural divs.
 
     Recurses so deeply nested wrappers (``<div><div><p>X</p></div></div>``)
-    flatten to ``[<p>X</p>]``. A div's own leading text and its tail are
-    yielded as ``str`` items: both sit at a block boundary, so the caller
-    starts them on a new line.
+    flatten to ``[<p>X</p>]``. An unwrapped div contributes
+    ``_CELL_BLOCK_BOUNDARY`` markers around its content, and its own
+    leading text and tail as ``str`` items with their leading whitespace
+    stripped, since that whitespace sits at a line break. Comments and
+    processing instructions are kept so the caller can report them and
+    keep their tails.
     """
 
-    out: list[ET._Element | str] = []
+    out: list[ET._Element | str | object] = []
     for child in parent:
-        if not isinstance(child.tag, str):
-            continue
-        local = strip_ns(child.tag)
-        ns = ns_of(child.tag)
-        if (ns is None or ns == "") and local == "div" and _is_transparent_cell_div(child):
+        if (
+            isinstance(child.tag, str)
+            and ns_of(child.tag) in (None, "")
+            and strip_ns(child.tag) == "div"
+            and _is_transparent_cell_div(child)
+        ):
+            out.append(_CELL_BLOCK_BOUNDARY)
             if child.text and child.text.strip():
-                out.append(child.text)
+                out.append(child.text.lstrip())
             out.extend(_flatten_cell_children(child))
+            out.append(_CELL_BLOCK_BOUNDARY)
             if child.tail and child.tail.strip():
-                out.append(child.tail)
+                out.append(child.tail.lstrip())
             continue
         out.append(child)
     return out
