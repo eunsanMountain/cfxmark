@@ -1119,7 +1119,7 @@ def _parse_cell_content(
 
     direct_children = [child for child in cell_el if isinstance(child.tag, str)]
     flat_children = list(_flatten_cell_children(cell_el))
-    has_p = any(isinstance(c.tag, str) and strip_ns(c.tag) == "p" for c in flat_children)
+    has_p = any(not isinstance(c, str) and isinstance(c.tag, str) and strip_ns(c.tag) == "p" for c in flat_children)
     if not has_p and flat_children == direct_children:
         return _parse_inline(cell_el, ctx)
 
@@ -1128,6 +1128,13 @@ def _parse_cell_content(
         out.append(Text(content=cell_el.text))
 
     for child in flat_children:
+        if isinstance(child, str):
+            # Loose text from an unwrapped div starts a new line, like
+            # a paragraph would.
+            if out:
+                out.append(HardBreak())
+            out.append(Text(content=child))
+            continue
         if not isinstance(child.tag, str):
             continue
         if strip_ns(child.tag) == "p":
@@ -1151,30 +1158,27 @@ def _parse_cell_content(
 
 def _flatten_cell_children(
     parent: ET._Element,
-) -> list[ET._Element]:
+) -> list[ET._Element | str]:
     """Yield ``parent``'s children, unwrapping known structural divs.
 
     Recurses so deeply nested wrappers (``<div><div><p>X</p></div></div>``)
-    flatten to ``[<p>X</p>]``.
+    flatten to ``[<p>X</p>]``. A div's own leading text and its tail are
+    yielded as ``str`` items: both sit at a block boundary, so the caller
+    starts them on a new line.
     """
 
-    out: list[ET._Element] = []
+    out: list[ET._Element | str] = []
     for child in parent:
         if not isinstance(child.tag, str):
             continue
         local = strip_ns(child.tag)
         ns = ns_of(child.tag)
         if (ns is None or ns == "") and local == "div" and _is_transparent_cell_div(child):
-            inner = _flatten_cell_children(child)
-            if not inner and child.text and child.text.strip():
-                # Pure text inside a div — synthesise a <p> shell so
-                # the caller's paragraph join-with-break logic still
-                # applies.
-                pseudo = ET.Element("p")
-                pseudo.text = child.text
-                out.append(pseudo)
-                continue
-            out.extend(inner)
+            if child.text and child.text.strip():
+                out.append(child.text)
+            out.extend(_flatten_cell_children(child))
+            if child.tail and child.tail.strip():
+                out.append(child.tail)
             continue
         out.append(child)
     return out

@@ -344,3 +344,23 @@ def test_unknown_macro_becomes_opaque() -> None:
     assert "<!-- cfxmark:opaque" in out
     assert "```cfx-storage" in out
     assert "totally-unknown-macro" in out
+
+
+# ---------------------------------------------------------------------------
+# Table cells with editor <div> wrappers
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("cell", "expected"),
+    [
+        ("before<div>inside</div>after", "before<br>inside<br>after"),
+        ("<div>inside</div>after", "inside<br>after"),
+        ('<div class="content-wrapper"><p>inside</p></div>after', "inside<br>after"),
+        ("<div>a<strong>b</strong>c</div>", "a**b**c"),
+        ("<div><div>x</div>y</div>z", "x<br>y<br>z"),
+    ],
+)
+def test_cell_div_keeps_surrounding_text(cell: str, expected: str) -> None:
+    out = md(f"<table><tbody><tr><th>h</th></tr><tr><td>{cell}</td></tr></tbody></table>")
+    assert out.splitlines()[-1] == f"| {expected} |"

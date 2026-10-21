@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Text after a `<div>` in a table cell was dropped.** `<td>before<div>inside</div>after</td>`
+  converted to `| before<br>inside |`: when a cell's editor `<div>` wrapper was unwrapped, its
+  tail was discarded, and so was its own leading text whenever it also held elements
+  (`<div>a<strong>b</strong></div>` lost `a`). Both are kept now; text after a div starts a new
+  line, as it renders in Confluence (#1).
+
 ## [0.6.1] - 2026-08-02
 
 Three changes to what the managed publish will and will not prove. An ordinary edit that
