@@ -123,7 +123,9 @@ opaque preservation as universal.
   passes `<br>` through verbatim, so the cell renders as two lines.
 * **Cells with `<div>` wrappers** — Confluence's editor often wraps
   cell content in `<div class="content-wrapper">`. The wrapper is
-  unwrapped transparently during conversion and canonicalization.
+  unwrapped during conversion and canonicalization. A div is a block,
+  so content before, inside and after it lands on separate lines
+  joined by `<br>`, like a multi-paragraph cell.
 * **Cells with embedded macros / images / lists** — emit through the
   inline opaque mechanism (see below) so the rest of the table stays
   native.
